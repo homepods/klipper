@@ -16,6 +16,10 @@ serial_init(void)
     gpio_peripheral('A', PIO_PA8A_URXD, 'A', 1);
     gpio_peripheral('A', PIO_PA9A_UTXD, 'A', 0);
 
+    // Initialize USART3 for WASP
+    gpio_peripheral('D', PIO_PD5B_RXD3, 'B', 1);
+    gpio_peripheral('D', PIO_PD4B_TXD3, 'B', 0);
+
     // Reset uart
     PMC->PMC_PCER0 = 1 << ID_UART;
     UART->UART_PTCR = UART_PTCR_RXTDIS | UART_PTCR_TXTDIS;

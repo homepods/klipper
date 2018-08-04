@@ -8,11 +8,14 @@ FAN_MIN_TIME = 0.100
 
 class PrinterFan:
     def __init__(self, config, default_shutdown_speed=0.):
+        self.printer = config.get_printer()
         self.last_fan_value = 0.
         self.last_fan_time = 0.
         self.max_power = config.getfloat('max_power', 1., above=0., maxval=1.)
+        self.min_power = config.getfloat('min_power', 0., minval=0., maxval=self.max_power)
+        self.start_speed = config.getint('start_speed', 0, minval=0, maxval=255)
         self.kick_start_time = config.getfloat('kick_start_time', 0.1, minval=0.)
-        ppins = config.get_printer().lookup_object('pins')
+        ppins = self.printer.lookup_object('pins')
         self.mcu_fan = ppins.setup_pin('pwm', config.get('pin'))
         self.mcu_fan.setup_max_duration(0.)
         cycle_time = config.getfloat('cycle_time', 0.010, above=0.)
@@ -22,8 +25,12 @@ class PrinterFan:
             'shutdown_speed', default_shutdown_speed, minval=0., maxval=1.)
         self.mcu_fan.setup_start_value(
             0., max(0., min(self.max_power, shutdown_speed)))
+    def printer_state(self, state):
+        if state == 'ready' and self.start_speed:
+            gcode = self.printer.lookup_object('gcode')
+            gcode.run_script_from_command('M106 S%d' % self.start_speed)
     def set_speed(self, print_time, value):
-        value = max(0., min(self.max_power, value * self.max_power))
+        value = max(self.min_power, min(self.max_power, value * self.max_power))
         if value == self.last_fan_value:
             return
         print_time = max(self.last_fan_time + FAN_MIN_TIME, print_time)

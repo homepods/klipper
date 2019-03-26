@@ -270,7 +270,7 @@ command_reset_step_clock(uint32_t *args)
 DECL_COMMAND(command_reset_step_clock, "reset_step_clock oid=%c clock=%u");
 
 // Return the current stepper position.  Caller must disable irqs.
-static uint32_t
+uint32_t
 stepper_get_position(struct stepper *s)
 {
     uint32_t position = s->position;

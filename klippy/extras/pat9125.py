@@ -74,7 +74,7 @@ class PAT9125_I2C:
         self.pat9125_write_verify_cmd = self.mcu.lookup_command(
             "command_pat9125_write_verify oid=%c sequence=%*s retries=%u",
             cq=self.get_command_queue())
-        self.mcu.register_msg(
+        self.mcu.register_response(
             self._response_handler, "pat9125_verify_response", self.oid)
     def _write_verify_request_event(self, eventtime):
         if self.write_verify_response is not None:
@@ -297,7 +297,7 @@ class PAT9125(BaseSensor):
         self.pat9125_state['X_POS'] = 0
         self.pat9125_state['Y_POS'] = 0
         self.tracker.reset()
-        self.mcu.register_msg(
+        self.mcu.register_response(
             self._handle_pat9125_update, "pat9125_update_response", self.oid)
 
         logging.debug("pat9125: Initialization Success")

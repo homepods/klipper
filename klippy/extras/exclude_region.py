@@ -40,14 +40,20 @@ class ExcludeRegion:
         self.printer.register_event_handler("klippy:ready",
                                             self._handle_ready)
         self.regions = {}
+        self.last_position = [0., 0., 0., 0.]
+        self.last_delta = [0., 0., 0., 0.]
     def _handle_ready(self):
         self.next_transform = self.gcode.set_move_transform(self, force=True)
     def get_position(self):
-        return self.next_transform.get_position()
+        self.last_position[:] = self.next_transform.get_position()
+        self.last_delta = [0., 0., 0., 0.]
+        return list(self.last_position)
     def move(self, newpos, speed):
         for r in self.regions.values():
             if r.check_within(newpos):
                 return
+        self.last_delta = [newpos[i] - self.last_position[i] for i in range(4)]
+        self.last_position[:] = newpos
         self.next_transform.move(newpos, speed)
     def cmd_EXCLUDE_RECT(self, params):
         name = self.gcode.get_str('NAME', params).upper()

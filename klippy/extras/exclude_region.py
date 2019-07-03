@@ -50,6 +50,15 @@ class ExcludeRegion:
         self.regions = {}
         self.last_position = [0., 0., 0., 0.]
         self.last_delta = [0., 0., 0., 0.]
+        self.gcode.register_command(
+            'EXCLUDE_RECT', self.cmd_EXCLUDE_RECT,
+            desc=self.cmd_EXCLUDE_RECT_help)
+        self.gcode.register_command(
+            'EXCLUDE_CIRCLE', self.cmd_EXCLUDE_CIRCLE,
+            desc=self.cmd_EXCLUDE_CIRCLE_help)
+        self.gcode.register_command(
+            'REMOVE_EXCLUDED_REGION', self.cmd_REMOVE_EXCLUDED_REGION,
+            desc=self.cmd_REMOVE_EXCLUDED_REGION_help)
         # debugging
         self.current_region = None
     def _handle_ready(self):
@@ -75,6 +84,7 @@ class ExcludeRegion:
         self.last_delta = [newpos[i] - self.last_position[i] for i in range(4)]
         self.last_position[:] = newpos
         self.next_transform.move(newpos, speed)
+    cmd_EXCLUDE_RECT_help = "Exclude moves to specificed rectanglar region"
     def cmd_EXCLUDE_RECT(self, params):
         name = self.gcode.get_str('NAME', params).upper()
         try:
@@ -86,6 +96,7 @@ class ExcludeRegion:
                 (params['#original']))
             return
         self.regions[name] = RectRegion(minpt, maxpt)
+    cmd_EXCLUDE_CIRCLE_help = "Exclude moves to specified circular region"
     def cmd_EXCLUDE_CIRCLE(self, params):
         name = self.gcode.get_str('NAME', params).upper()
         try:
@@ -97,7 +108,11 @@ class ExcludeRegion:
             return
         radius = self.gcode.get_float('RADIUS', params)
         self.regions[name] = CircRegion(centerpt, radius)
+    cmd_REMOVE_EXCLUDED_REGION_help = "Remove a specified excluded region"
     def cmd_REMOVE_EXCLUDED_REGION(self, params):
+        if self.gcode.get_int('ALL', params, 0):
+            self.regions = {}
+            return
         name = self.gcode.get_str('NAME', params).upper()
         if name in self.regions:
             del self.regions[name]

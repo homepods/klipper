@@ -37,6 +37,13 @@ class ExcludeRegion:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
+        # Temporary workaround to get skew_correction to register
+        # its "klippy:ready" event handler before Exclude Region.  Exclude
+        # Region needs to be the highest priority transform, thus it must be
+        # the last module that calls set_move_transform()
+        if config.has_section('skew_correction'):
+            self.printer.try_load_module(config, 'skew_correction')
+        # Now ExcludeRegion can register its own event handler
         self.printer.register_event_handler("klippy:ready",
                                             self._handle_ready)
         self.regions = {}

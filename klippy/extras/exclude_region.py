@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import math
+import logging
 
 def parse_pair(pair):
     pts = pair.strip().split(',', 1)
@@ -49,6 +50,8 @@ class ExcludeRegion:
         self.regions = {}
         self.last_position = [0., 0., 0., 0.]
         self.last_delta = [0., 0., 0., 0.]
+        # debugging
+        self.current_region = None
     def _handle_ready(self):
         self.next_transform = self.gcode.set_move_transform(self, force=True)
     def get_position(self):
@@ -56,9 +59,19 @@ class ExcludeRegion:
         self.last_delta = [0., 0., 0., 0.]
         return list(self.last_position)
     def move(self, newpos, speed):
-        for r in self.regions.values():
+        for key, r in self.regions.iteritems():
             if r.check_within(newpos):
+                if self.current_region is None:
+                    self.current_region = key
+                    logging.info(
+                        "Entered Excluded Region {%s}, coordinate: %.2f, %.2f"
+                        % (key, newpos[0], newpos[1]))
                 return
+        if self.current_region is not None:
+            logging.info(
+                "Exited Excluded Region {%s}, coordinate: %.2f, %.2f"
+                % (self.current_region, newpos[0], newpos[1]))
+        self.current_region = None
         self.last_delta = [newpos[i] - self.last_position[i] for i in range(4)]
         self.last_position[:] = newpos
         self.next_transform.move(newpos, speed)

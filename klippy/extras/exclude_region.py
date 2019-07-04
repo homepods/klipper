@@ -48,6 +48,8 @@ class ExcludeRegion:
         self.printer.register_event_handler("klippy:ready",
                                             self._handle_ready)
         self.regions = {}
+        self.objects = []
+        self.current_object = ""
         self.last_position = [0., 0., 0., 0.]
         self.last_delta = [0., 0., 0., 0.]
         self.gcode.register_command(
@@ -59,6 +61,18 @@ class ExcludeRegion:
         self.gcode.register_command(
             'REMOVE_EXCLUDED_REGION', self.cmd_REMOVE_EXCLUDED_REGION,
             desc=self.cmd_REMOVE_EXCLUDED_REGION_help)
+        self.gcode.register_command(
+            'SET_CURRENT_OBJECT', self.cmd_SET_CURRENT_OBJECT,
+            desc=self.cmd_SET_CURRENT_OBJECT_help)
+        self.gcode.register_command(
+            'CANCEL_OBJECT', self.cmd_CANCEL_OBJECT,
+            desc=self.cmd_CANCEL_OBJECT_help)
+        self.gcode.register_command(
+            'REMOVE_CANCELED_OBJECT', self.cmd_REMOVE_CANCELED_OBJECT,
+            desc=self.cmd_REMOVE_CANCELED_OBJECT_help)
+        self.gcode.register_command(
+            'REMOVE_ALL_EXCLUDED', self.cmd_REMOVE_ALL_EXCLUDED,
+            desc=self.cmd_REMOVE_ALL_EXCLUDED_help)
         # debugging
         self.current_region = None
     def _handle_ready(self):
@@ -68,8 +82,12 @@ class ExcludeRegion:
         self.last_delta = [0., 0., 0., 0.]
         return list(self.last_position)
     def move(self, newpos, speed):
+        if self.current_object in self.objects:
+            # Inside cancelled object
+            return
         for key, r in self.regions.iteritems():
             if r.check_within(newpos):
+                # Inside cancelled region
                 if self.current_region is None:
                     self.current_region = key
                     logging.info(
@@ -110,9 +128,6 @@ class ExcludeRegion:
         self.regions[name] = CircRegion(centerpt, radius)
     cmd_REMOVE_EXCLUDED_REGION_help = "Remove a specified excluded region"
     def cmd_REMOVE_EXCLUDED_REGION(self, params):
-        if self.gcode.get_int('ALL', params, 0):
-            self.regions = {}
-            return
         name = self.gcode.get_str('NAME', params).upper()
         if name in self.regions:
             del self.regions[name]
@@ -120,6 +135,23 @@ class ExcludeRegion:
             self.gcode.respond_info(
                 "exclude_region: No region named [%s] to remove" %
                 (name))
+    cmd_SET_CURRENT_OBJECT_help = "Set the current object as labeled"
+    def cmd_SET_CURRENT_OBJECT(self, params):
+        self.current_object = self.gcode.get_str('NAME', params).upper()
+    cmd_CANCEL_OBJECT_help = "Cancel moves inside a specified objects"
+    def cmd_CANCEL_OBJECT(self, params):
+        name = self.gcode.get_str('NAME', params).upper()
+        if name not in self.objects:
+            self.objects.append(name)
+    cmd_REMOVE_CANCELED_OBJECT_help = "Remove cancelled object"
+    def cmd_REMOVE_CANCELED_OBJECT(self, params):
+        name = self.gcode.get_str('NAME', params).upper()
+        if name in self.objects:
+            self.objects.remove(name)
+    cmd_REMOVE_ALL_EXCLUDED_help = "Removes all excluded objects and regions"
+    def cmd_REMOVE_ALL_EXCLUDED(self, params):
+        self.regions = {}
+        self.objects = []
 
 def load_config(config):
     return ExcludeRegion(config)

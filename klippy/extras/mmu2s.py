@@ -12,7 +12,6 @@ import filament_switch_sensor
 
 MMU2_BAUD = 115200
 RESPONSE_TIMEOUT = 45.
-MMU_RESP_STATE = {"DISCONNECT": 0, "NACK": 1, "ACK": 2}
 
 MMU_COMMANDS = {
     "SET_TOOL": "T%d",
@@ -197,35 +196,46 @@ class MMU2Serial:
                     self.notifcation_cb(line)
             if ack_count > 1:
                 logging.warn("mmu2s: multiple acknowledgements recd")
-    def send_with_response(self, data, timeout=RESPONSE_TIMEOUT):
+    def send_with_response(self, data, timeout=RESPONSE_TIMEOUT, retries=2):
         with self.mutex:
             if not self.connected:
-                return MMU_RESP_STATE['DISCONNECT'], ""
+                raise self.gcode.error(
+                    "mmu2s: mmu disconnected, cannot send command %s" %
+                    str(data[:-1]))
             self.mmu_response = None
-            try:
-                self.ser.write(data)
-            except serial.SerialException as e:
-                logging.warn("MMU2S disconnected")
-                self.connected = False
-                self.reactor.unregister_fd(self.fd_handle)
-                self.fd_handle = self.fd = None
-            curtime = self.reactor.monotonic()
-            endtime = curtime + timeout
-            pause_count = 0
-            while self.mmu_response is None:
-                if not self.connected:
-                    return MMU_RESP_STATE['DISCONNECT'], ""
-                if curtime > endtime:
-                    return MMU_RESP_STATE['NACK'], ""
-                curtime = self.reactor.pause(curtime + .01)
-                pause_count += 1
-                if pause_count >= 200:
-                    self.gcode.respond_info("mmu2s: waiting for response")
-                    pause_count = 0
-            resp = self.mmu_response
-            self.mmu_response = None
-            return MMU_RESP_STATE['ACK'], resp
-
+            while retries:
+                try:
+                    self.ser.write(data)
+                except serial.SerialException as e:
+                    logging.warn("MMU2S disconnected")
+                    self.connected = False
+                    self.reactor.unregister_fd(self.fd_handle)
+                    self.fd_handle = self.fd = None
+                curtime = self.reactor.monotonic()
+                last_resp_time = curtime
+                endtime = curtime + timeout
+                while self.mmu_response is None:
+                    if not self.connected:
+                        raise self.gcode.error(
+                            "mmu2s: mmu disconnected, cannot send command %s" %
+                            str(data[:-1]))
+                    if curtime >= endtime:
+                        break
+                    curtime = self.reactor.pause(curtime + .01)
+                    if curtime - last_resp_time >= 2.:
+                        self.gcode.respond_info(
+                            "mmu2s: waiting for response, %.2fs remaining" %
+                            (endtime - curtime))
+                        last_resp_time = curtime
+                else:
+                    # command acknowledge, response recd
+                    resp = self.mmu_response
+                    self.mmu_response = None
+                    return resp
+                retries -= 1
+            raise self.gcode.error(
+                    "mmu2s: no acknowledgment for command %s" %
+                    (str(data[:-1])))
 
 class MMU2S:
     def __init__(self, config):
@@ -239,6 +249,8 @@ class MMU2S:
         self.reset_pin.setup_max_duration(0.)
         self.reset_pin.setup_start_value(1, 1)
         self.mmu_serial = MMU2Serial(config, self.mmu_notification)
+        self.finda = FindaSensor(config, self)
+        self.ir_sensor = IdlerSensor(config)
         self.mmu_ready = False
         self.current_extruder = 0
         for t_cmd in ["Tx, Tc, T?"]:
@@ -248,14 +260,14 @@ class MMU2S:
         self.gcode.register_command(
             "MMU_SET_TMC", self.cmd_MMU_SET_TMC)
         self.gcode.register_command(
-            "MMU_READ_FINDA", self.cmd_MMU_READ_FINDA)
+            "MMU_READ_IR", self.cmd_MMU_READ_IR)
         self.printer.register_event_handler(
             "klippy:ready", self._handle_ready)
         self.printer.register_event_handler(
             "klippy:disconnect", self._handle_disconnect)
         self.printer.register_event_handler(
             "gcode:request_restart", self._handle_restart)
-    def send_command(self, cmd, reqtype=None, retries=2):
+    def send_command(self, cmd, reqtype=None):
         if cmd not in MMU_COMMANDS:
             raise self.gcode.error("mmu2s: Unknown MMU Command %s" % (cmd))
         command = MMU_COMMANDS[cmd]
@@ -263,40 +275,18 @@ class MMU2S:
             command = command % (reqtype)
         outbytes = bytes(command + '\n')
         if 'P' in command:
-            status, resp = self.mmu_serial.send_with_response(outbytes, 3.)
+            return self.mmu_serial.send_with_response(outbytes, timeout=3.)
         else:
-            status, resp = self.mmu_serial.send_with_response(outbytes)
-        if status == MMU_RESP_STATE['ACK']:
-            return resp
-        elif status == MMU_RESP_STATE['NACK']:
-            # attempt a resend
-            if retries:
-                response = self.send_command(cmd, reqtype, retries=(retries -1))
-                if response is None:
-                    raise self.gcode.error(
-                        "mmu2s: no acknowledgment for command %s" %
-                        (command))
-            else:
-                return None
-        elif status == MMU_RESP_STATE['DISCONNECT']:
-            # Try reconnecting
-            reactor = self.printer.get_reactor()
-            self.mmu_serial.connect(reactor.monotonic())
-            if retries:
-                response = self.send_command(cmd, reqtype, retries=(retries -1))
-                if response is None:
-                    raise self.gcode.error(
-                        "mmu2s: mmu disconnected, cannot send command %s" %
-                        (command))
-            else:
-                return None
+            return self.mmu_serial.send_with_response(outbytes)
     def _handle_ready(self):
         reactor = self.printer.get_reactor()
         connect_time = self._hardware_reset()
         reactor.register_callback(self.mmu_serial.connect, connect_time)
     def _handle_restart(self, print_time):
+        self.finda.stop_query()
         self.mmu_serial.disconnect()
     def _handle_disconnect(self):
+        self.finda.stop_query()
         self.mmu_serial.disconnect()
     def _hardware_reset(self):
         toolhead = self.printer.lookup_object('toolhead')
@@ -308,6 +298,8 @@ class MMU2S:
         self.gcode.respond_info("mmu2s: Notification received\n %s", data)
         if data == "start":
             self.mmu_ready = True
+            self.gcode.respond_info("mmu2s: connected and ready")
+            self.finda.start_query()
     def change_tool(self, index):
         pass
     def cmd_T_SPECIAL(self, params):
@@ -330,9 +322,9 @@ class MMU2S:
     def cmd_MMU_SET_TMC(self, params):
         mode = self.gcode.get_into('MODE', params)
         self.send_command("SET_TMC_MODE", mode)
-    def cmd_MMU_READ_FINDA(self, params):
-        finda = self.send_command("READ_FINDA")[:-2]
-        self.gcode.respond_info("mmu2s: Finda Status = [%s]" % finda)
+    def cmd_MMU_READ_IR(self, params):
+        ir_status = self.ir_sensor.get_idler_state()
+        self.gcode.respond_info("mmu2s: IR Sensor Status = [%d]" % ir_status)
 
 def load_config(config):
     return MMU2S(config)

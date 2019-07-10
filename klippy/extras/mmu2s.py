@@ -162,6 +162,8 @@ class MMU2S:
         self.mmu_serial = MMU2Serial(config, self.mmu_notification)
         self.mmu_ready = False
         self.current_extruder = 0
+        for t_cmd in ["Tx, Tc, T?"]:
+            self.gcode.register_command(t_cmd, self.cmd_T_SPECIAL)
         self.gcode.register_command(
             "MMU_GET_STATUS", self.cmd_MMU_GET_STATUS)
         self.gcode.register_command(
@@ -227,6 +229,17 @@ class MMU2S:
         self.gcode.respond_info("mmu2s: Notification received\n %s", data)
         if data == "start":
             self.mmu_ready = True
+    def change_tool(self, index):
+        pass
+    def cmd_T_SPECIAL(self, params):
+        # Hand T commands followed by special characters (x, c, ?)
+        cmd = params['#command'].upper()
+        if 'X' in cmd:
+            pass
+        elif 'C' in cmd:
+            pass
+        elif '?' in cmd:
+            pass
     def cmd_MMU_GET_STATUS(self, params):
         ack = self.send_command("CHECK_ACK")
         version = self.send_command("GET_VERSION")[:-2]

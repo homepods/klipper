@@ -8,6 +8,7 @@ import os
 import logging
 import serial
 import threading
+import filament_switch_sensor
 
 MMU2_BAUD = 115200
 RESPONSE_TIMEOUT = 45.
@@ -34,6 +35,67 @@ MMU_COMMANDS = {
 
 class error(Exception):
     pass
+
+class FindaSensor(filament_switch_sensor.BaseSensor):
+    EVENT_DELAY = 5.
+    FINDA_REFRESH_TIME = 3.
+    def __init__(self, config, mmu):
+        super(FindaSensor, self).__init__(config)
+        self.name = "Finda"
+        self.printer = config.get_printer()
+        self.reactor = config.get_reactor()
+        self.mmu = mmu
+        # TODO: need to update the runout gcode for this,
+        # i'm not exactly sure what action it should take
+        # currently just sending a notification to the display
+        gcode_macro = self.printer.try_load_module(config, 'gcode_macro')
+        self.runout_gcode = gcode_macro.load_template(
+            "M118 Finda Runout Detected\n")
+        self.last_state = False
+        self.last_event_time = 0.
+        self.query_timer = self.reactor.register_timer(self._finda_event)
+        self.sensor_enabled = True
+        self.gcode.register_mux_command(
+            "QUERY_FILAMENT_SENSOR", "SENSOR", self.name,
+            self.cmd_QUERY_FILAMENT_SENSOR,
+            desc=self.cmd_QUERY_FILAMENT_SENSOR_help)
+        self.gcode.register_mux_command(
+            "SET_FILAMENT_SENSOR", "SENSOR", self.name,
+            self.cmd_SET_FILAMENT_SENSOR,
+            desc=self.cmd_SET_FILAMENT_SENSOR_help)
+    def start_query(self):
+        self.last_state = int(self.mmu.send_command("READ_FINDA")[:-2])
+        waketime = self.reactor.monotonic() + self.FINDA_REFRESH_TIME
+        self.reactor.update_timer(self.query_timer, waketime)
+    def stop_query(self):
+        self.reactor.update_timer(self.query_timer, self.reactor.NEVER)
+    def _finda_event(self, eventtime):
+        finda_val = int(self.mmu.send_command("READ_FINDA")[:-2])
+        if finda_val == self.last_state:
+            return
+        if not finda_val:
+            # transition from filament present to not present
+            if (self.runout_enabled and self.sensor_enabled and
+                    (eventtime - self.last_event_time) > self.EVENT_DELAY):
+                # Filament runout detected
+                self.last_event_time = eventtime
+                logging.info(
+                    "switch_sensor: runout event detected, Time %.2f",
+                    eventtime)
+                self.reactor.register_callback(self._runout_event_handler)
+        return eventtime + self.FINDA_REFRESH_TIME4
+    def cmd_QUERY_FILAMENT_SENSOR(self, params):
+        if self.last_button_state:
+            msg = "Finda: filament detected"
+        else:
+            msg = "Finda: filament not detected"
+        self.gcode.respond_info(msg)
+    def cmd_SET_FILAMENT_SENSOR(self, params):
+        self.sensor_enabled = self.gcode.get_int("ENABLE", params, 1)
+
+class IdlerSensor:
+    def __init__(self, config):
+        pass
 
 class MMU2Serial:
     def __init__(self, config, notifcation_cb):

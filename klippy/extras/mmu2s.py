@@ -13,6 +13,25 @@ MMU2_BAUD = 115200
 RESPONSE_TIMEOUT = 45.
 MMU_RESP_STATE = {"DISCONNECT": 0, "NACK": 1, "ACK": 2}
 
+MMU_COMMANDS = {
+    "SET_TOOL": "T%d",
+    "LOAD_FILAMENT": "L%d",
+    "SET_TMC_MODE": "M%d",
+    "UNLOAD_FILAMENT": "U%d",
+    "RESET": "X0",
+    "READ_FINDA": "P0",
+    "CHECK_ACK": "S0",
+    "GET_VERSION": "S1",
+    "GET_BUILD_NUMBER": "S2",
+    "GET_DRIVE_ERRORS": "S3",
+    "SET_FILAMENT": "F%d",  # This appears to be a placeholder, does nothing
+    "CONTINUE_LOAD": "C0",  # Load to printer gears
+    "EJECT_FILAMENT": "E%d",
+    "RECOVER": "R0",        # Recover after eject
+    "WAIT_FOR_USER": "W0",
+    "CUT_FILAMENT": "K0"
+}
+
 class error(Exception):
     pass
 
@@ -129,22 +148,41 @@ class MMU2Serial:
         return MMU_RESP_STATE['ACK'], resp
 
 
-class MMU2Commands:
-    def __init__(self, serial, gcode):
-        self.serial = serial
-        self.gcode = gcode
-    def _send_command(self, command, retry=True):
-        cmd = bytes(command + '\n')
+class MMU2S:
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.gcode = self.printer.lookup_object('gcode')
+        self.mmu_serial = MMU2Serial(config, self.mmu_notification)
+        self.current_extruder = 0
+        self.gcode.register_command(
+            "MMU_GET_STATUS", self.cmd_MMU_GET_STATUS)
+        self.gcode.register_command(
+            "MMU_SET_TMC", self.cmd_MMU_SET_TMC)
+        self.gcode.register_command(
+            "MMU_READ_FINDA", self.cmd_MMU_READ_FINDA)
+        self.printer.register_event_handler(
+            "klippy:connect", self._handle_connect)
+        self.printer.register_event_handler(
+            "klippy:disconnect", self._handle_disconnect)
+        self.printer.register_event_handler(
+            "gcode:request_restart", self._handle_restart)
+    def _send_command(self, cmd, reqtype=None, retries=1):
+        if cmd not in MMU_COMMANDS:
+            raise self.gcode.error( "mmu2s: Unknown MMU Command %s" % (cmd))
+        command = MMU_COMMANDS[cmd]
+        if reqtype is not None:
+            command = command % (reqtype)
+        outbytes = bytes(command + '\n')
         if 'P' in command:
-            status, resp = self.serial.send_with_response(cmd, 3.)
+            status, resp = self.mmu_serial.send_with_response(outbytes, 3.)
         else:
-            status, resp = self.serial.send_with_response(cmd)
+            status, resp = self.mmu_serial.send_with_response(outbytes)
         if status == MMU_RESP_STATE['ACK']:
             return resp
         elif status == MMU_RESP_STATE['NACK']:
             # attempt a resend
-            if retry:
-                response = self._send_command(command, retry=False)
+            if retries:
+                response = self._send_command(cmd, reqtype, retries=(retries -1))
                 if response is None:
                     raise self.gcode.error(
                         "mmu2s: no acknowledgment for command %s" %
@@ -153,75 +191,16 @@ class MMU2Commands:
                 return None
         elif status == MMU_RESP_STATE['DISCONNECT']:
             # Try reconnecting
-            self.serial.connect()
-            if retry:
-                response = self._send_command(command, retry=False)
+            reactor = self.printer.get_reactor()
+            self.mmu_serial.connect(reactor.monotonic())
+            if retries:
+                response = self._send_command(cmd, reqtype, retries=(retries -1))
                 if response is None:
                     raise self.gcode.error(
                         "mmu2s: mmu disconnected, cannot send command %s" %
                         (command))
             else:
                 return None
-    def change_tool(self, tool):
-        #  T(n)
-        pass
-    def load_filament(self, tool):
-        # L(n)
-        pass
-    def set_tmc_mode(self, mode):
-        # M(n)
-        resp = self._send_command("M%d" % req)
-        return resp
-    def unload_filament(self, tool):
-        # U(n)
-        pass
-    def reset_mmu(self):
-        # X0
-        pass
-    def read_finda(self):
-        # P0 -  only 3 second ack timeout for this command
-        pass
-    def get_status(self, req):
-        # S0 - basic ack
-        # S1 - read version
-        # S2 - read build number
-        # S3 - read drive error
-        resp = self._send_command("S%d" % req)
-        return resp
-    def set_filament_type(self, tool):
-        # F(n) - currently does nothing for MMU
-        # likely reserved for future use
-        pass
-    def continue_load(self):
-        # C0
-        pass
-    def eject_filament(self):
-        # E(n)
-        pass
-    def recover(self):
-        # R0 - recover after eject
-        pass
-    def cut_filament(self, tool):
-        # K(n)
-        pass
-
-class MMU2S:
-    def __init__(self, config):
-        self.printer = config.get_printer()
-        self.gcode = self.printer.lookup_object('gcode')
-        self.mmu_serial = MMU2Serial(config, self.mmu_notification)
-        self.mmu_commands = MMU2Commands(self.mmu_serial, self.gcode)
-        self.current_extruder = 0
-        self.gcode.register_command(
-            "MMU_GET_STATUS", self.cmd_MMU_GET_STATUS)
-        self.gcode.register_command(
-            "MMU_SET_TMC", self.cmd_MMU_SET_TMC)
-        self.printer.register_event_handler(
-            "klippy:connect", self._handle_connect)
-        self.printer.register_event_handler(
-            "klippy:disconnect", self._handle_disconnect)
-        self.printer.register_event_handler(
-            "gcode:request_restart", self._handle_restart)
     def _handle_connect(self):
         reactor = self.printer.get_reactor()
         self.mmu_serial.connect(reactor.monotonic())
@@ -233,16 +212,19 @@ class MMU2S:
         # XXX - Will need to parse these notifications and do something with them
         self.gcode.respond_info("mmu2s: Notification received\n %s", data)
     def cmd_MMU_GET_STATUS(self, params):
-        ack = self.mmu_commands.get_status(0)
-        version = self.mmu_commands.get_status(1)[:-2]
-        build = self.mmu_commands.get_status(2)[:-2]
-        errors = self.mmu_commands.get_status(3)[:-2]
+        ack = self._send_command("CHECK_ACK")
+        version = self._send_command("GET_VERSION")[:-2]
+        build = self._send_command("GET_BUILD_NUMBER")[:-2]
+        errors = self._send_command("GET_DRIVE_ERRORS")[:-2]
         status = ("MMU Status:\nAcknowledge Test: %s\nVersion: %s\n" +
                   "Build Number: %s\nDrive Errors:%s\n")
         self.gcode.respond_info(status % (ack, version, build, errors))
     def cmd_MMU_SET_TMC(self, params):
         mode = self.gcode.get_into('MODE', params)
-        self.mmu_commands.set_tmc_mode(mode)
+        self._send_command("SET_TMC_MODE", mode)
+    def cmd_MMU_READ_FINDA(self, params):
+        finda = self._send_command("READ_FINDA")[:-2]
+        self.gcode.respond_info("mmu2s: Finda Status = [%s]" % finda)
 
 def load_config(config):
     return MMU2S(config)

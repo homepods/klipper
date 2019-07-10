@@ -152,7 +152,15 @@ class MMU2S:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
+
+        # Setup hardware reset pin
+        ppins = self.printer.lookup_object('pins')
+        self.reset_pin = ppins.setup_pin(
+            'digital_out', config.get('reset_pin'))
+        self.reset_pin.setup_max_duration(0.)
+        self.reset_pin.setup_start_value(1, 1)
         self.mmu_serial = MMU2Serial(config, self.mmu_notification)
+        self.mmu_ready = False
         self.current_extruder = 0
         self.gcode.register_command(
             "MMU_GET_STATUS", self.cmd_MMU_GET_STATUS)
@@ -161,14 +169,14 @@ class MMU2S:
         self.gcode.register_command(
             "MMU_READ_FINDA", self.cmd_MMU_READ_FINDA)
         self.printer.register_event_handler(
-            "klippy:connect", self._handle_connect)
+            "klippy:ready", self._handle_ready)
         self.printer.register_event_handler(
             "klippy:disconnect", self._handle_disconnect)
         self.printer.register_event_handler(
             "gcode:request_restart", self._handle_restart)
-    def _send_command(self, cmd, reqtype=None, retries=1):
+    def send_command(self, cmd, reqtype=None, retries=2):
         if cmd not in MMU_COMMANDS:
-            raise self.gcode.error( "mmu2s: Unknown MMU Command %s" % (cmd))
+            raise self.gcode.error("mmu2s: Unknown MMU Command %s" % (cmd))
         command = MMU_COMMANDS[cmd]
         if reqtype is not None:
             command = command % (reqtype)
@@ -182,7 +190,7 @@ class MMU2S:
         elif status == MMU_RESP_STATE['NACK']:
             # attempt a resend
             if retries:
-                response = self._send_command(cmd, reqtype, retries=(retries -1))
+                response = self.send_command(cmd, reqtype, retries=(retries -1))
                 if response is None:
                     raise self.gcode.error(
                         "mmu2s: no acknowledgment for command %s" %
@@ -194,36 +202,44 @@ class MMU2S:
             reactor = self.printer.get_reactor()
             self.mmu_serial.connect(reactor.monotonic())
             if retries:
-                response = self._send_command(cmd, reqtype, retries=(retries -1))
+                response = self.send_command(cmd, reqtype, retries=(retries -1))
                 if response is None:
                     raise self.gcode.error(
                         "mmu2s: mmu disconnected, cannot send command %s" %
                         (command))
             else:
                 return None
-    def _handle_connect(self):
+    def _handle_ready(self):
         reactor = self.printer.get_reactor()
-        self.mmu_serial.connect(reactor.monotonic())
+        connect_time = self._hardware_reset()
+        reactor.register_callback(self.mmu_serial.connect, connect_time)
     def _handle_restart(self, print_time):
         self.mmu_serial.disconnect()
     def _handle_disconnect(self):
         self.mmu_serial.disconnect()
+    def _hardware_reset(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        print_time = toolhead.get_last_move_time()
+        self.reset_pin.set_digital(print_time, 0)
+        self.reset_pin.set_digital(print_time + .1, 1)
+        return print_time + .2
     def mmu_notification(self, data):
-        # XXX - Will need to parse these notifications and do something with them
         self.gcode.respond_info("mmu2s: Notification received\n %s", data)
+        if data == "start":
+            self.mmu_ready = True
     def cmd_MMU_GET_STATUS(self, params):
-        ack = self._send_command("CHECK_ACK")
-        version = self._send_command("GET_VERSION")[:-2]
-        build = self._send_command("GET_BUILD_NUMBER")[:-2]
-        errors = self._send_command("GET_DRIVE_ERRORS")[:-2]
+        ack = self.send_command("CHECK_ACK")
+        version = self.send_command("GET_VERSION")[:-2]
+        build = self.send_command("GET_BUILD_NUMBER")[:-2]
+        errors = self.send_command("GET_DRIVE_ERRORS")[:-2]
         status = ("MMU Status:\nAcknowledge Test: %s\nVersion: %s\n" +
                   "Build Number: %s\nDrive Errors:%s\n")
         self.gcode.respond_info(status % (ack, version, build, errors))
     def cmd_MMU_SET_TMC(self, params):
         mode = self.gcode.get_into('MODE', params)
-        self._send_command("SET_TMC_MODE", mode)
+        self.send_command("SET_TMC_MODE", mode)
     def cmd_MMU_READ_FINDA(self, params):
-        finda = self._send_command("READ_FINDA")[:-2]
+        finda = self.send_command("READ_FINDA")[:-2]
         self.gcode.respond_info("mmu2s: Finda Status = [%s]" % finda)
 
 def load_config(config):

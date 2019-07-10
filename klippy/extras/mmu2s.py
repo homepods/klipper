@@ -36,21 +36,27 @@ MMU_COMMANDS = {
 class error(Exception):
     pass
 
+# XXX - The current gcode is temporary.  Need to determine
+# the appropriate action the printer and MMU should take
+# on a finda runout, then execute the appropriate gcode.
+# I suspect it is some form of M600
+FINDA_GCODE = '''
+M118 Finda Runout Detected
+M117 Finda Runout Detected
+'''
+
 class FindaSensor(filament_switch_sensor.BaseSensor):
-    EVENT_DELAY = 5.
-    FINDA_REFRESH_TIME = 3.
+    EVENT_DELAY = 3.
+    FINDA_REFRESH_TIME = .3
     def __init__(self, config, mmu):
         super(FindaSensor, self).__init__(config)
-        self.name = "Finda"
+        self.name = "FINDA"
         self.printer = config.get_printer()
         self.reactor = config.get_reactor()
         self.mmu = mmu
-        # TODO: need to update the runout gcode for this,
-        # i'm not exactly sure what action it should take
-        # currently just sending a notification to the display
         gcode_macro = self.printer.try_load_module(config, 'gcode_macro')
         self.runout_gcode = gcode_macro.load_template(
-            "M118 Finda Runout Detected\n")
+            config, 'runout_gcode', FINDA_GCODE)
         self.last_state = False
         self.last_event_time = 0.
         self.query_timer = self.reactor.register_timer(self._finda_event)
@@ -115,6 +121,7 @@ class MMU2Serial:
         self.ser = None
         self.connected = False
         self.mmu_response = None
+        self.mutex = self.reactor.mutex()
         self.notifcation_cb = notifcation_cb
         self.partial_response = ""
         self.fd_handle = self.fd = None
@@ -191,32 +198,33 @@ class MMU2Serial:
             if ack_count > 1:
                 logging.warn("mmu2s: multiple acknowledgements recd")
     def send_with_response(self, data, timeout=RESPONSE_TIMEOUT):
-        if not self.connected:
-            return MMU_RESP_STATE['DISCONNECT'], ""
-        self.mmu_response = None
-        try:
-            self.ser.write(data)
-        except serial.SerialException as e:
-            logging.warn("MMU2S disconnected")
-            self.connected = False
-            self.reactor.unregister_fd(self.fd_handle)
-            self.fd_handle = self.fd = None
-        curtime = self.reactor.monotonic()
-        endtime = curtime + timeout
-        pause_count = 0
-        while self.mmu_response is None:
+        with self.mutex:
             if not self.connected:
                 return MMU_RESP_STATE['DISCONNECT'], ""
-            if curtime > endtime:
-                return MMU_RESP_STATE['NACK'], ""
-            curtime = self.reactor.pause(curtime + .01)
-            pause_count += 1
-            if pause_count >= 200:
-                self.gcode.respond_info("mmu2s: waiting for response")
-                pause_count = 0
-        resp = self.mmu_response
-        self.mmu_response = None
-        return MMU_RESP_STATE['ACK'], resp
+            self.mmu_response = None
+            try:
+                self.ser.write(data)
+            except serial.SerialException as e:
+                logging.warn("MMU2S disconnected")
+                self.connected = False
+                self.reactor.unregister_fd(self.fd_handle)
+                self.fd_handle = self.fd = None
+            curtime = self.reactor.monotonic()
+            endtime = curtime + timeout
+            pause_count = 0
+            while self.mmu_response is None:
+                if not self.connected:
+                    return MMU_RESP_STATE['DISCONNECT'], ""
+                if curtime > endtime:
+                    return MMU_RESP_STATE['NACK'], ""
+                curtime = self.reactor.pause(curtime + .01)
+                pause_count += 1
+                if pause_count >= 200:
+                    self.gcode.respond_info("mmu2s: waiting for response")
+                    pause_count = 0
+            resp = self.mmu_response
+            self.mmu_response = None
+            return MMU_RESP_STATE['ACK'], resp
 
 
 class MMU2S:

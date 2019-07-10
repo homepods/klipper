@@ -7,7 +7,7 @@ import logging
 
 class BaseSensor(object):
     def __init__(self, config):
-        self.name = config.get_name().split()[1]
+        self.name = config.get_name().split()[-1]
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
         self.runout_pause = config.getboolean('pause_on_runout', True)

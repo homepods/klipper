@@ -83,9 +83,10 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
                     "switch_sensor: runout event detected, Time %.2f",
                     eventtime)
                 self.reactor.register_callback(self._runout_event_handler)
-        return eventtime + self.FINDA_REFRESH_TIME4
+        self.last_state = finda_val
+        return eventtime + self.FINDA_REFRESH_TIME
     def cmd_QUERY_FILAMENT_SENSOR(self, params):
-        if self.last_button_state:
+        if self.last_state:
             msg = "Finda: filament detected"
         else:
             msg = "Finda: filament not detected"
@@ -95,7 +96,15 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
 
 class IdlerSensor:
     def __init__(self, config):
-        pass
+        pin = config.get('idler_sensor_pin')
+        printer = config.get_printer()
+        buttons = printer.try_load_module(config, 'buttons')
+        buttons.register_buttons([pin], self._button_handler)
+        self.last_state = False
+    def _button_handler(self, state, eventtime):
+        self.last_state = state
+    def get_idler_state(self):
+        return self.last_state
 
 class MMU2Serial:
     def __init__(self, config, notifcation_cb):

@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 import os
+import subprocess
 import logging
 import serial
 import threading
@@ -32,8 +33,42 @@ MMU_COMMANDS = {
     "CUT_FILAMENT": "K0"
 }
 
-class error(Exception):
-    pass
+# Run command helper function allows stdout to be redirected
+# to the ptty without its file descriptor.
+def run_command(command):
+    p = subprocess.Popen(command,
+                         stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT)
+    return iter(p.stdout.readline, b'')
+
+# USB Device Helper Functions
+
+# Checks to see if device is in bootloader mode
+# Returns True if in bootloader mode, False if in device mode
+# and None if no device is detected
+def check_bootloader(portname):
+    ttyname = os.path.realpath(portname)
+    for fname in os.listdir('/dev/serial/by-id/'):
+        fname = '/dev/serial/by-id/' + fname
+        if os.path.realpath(fname) == ttyname and \
+                "Multi_Material" in fname:
+            return "bootloader" in fname
+    return None
+
+# Attempts to detect the serial port for a connected MMU device.
+# Returns the device name by usb path if device is found, None
+# if no device is found. Note that this isn't reliable if multiple
+# mmu devices are connected via USB.
+def detect_mmu_port():
+    for fname in os.listdir('/dev/serial/by-id/'):
+        if "MK3_Multi_Material_2.0" in fname:
+            fname = '/dev/serial/by-id/' + fname
+            realname = os.path.realpath(fname)
+            for fname in os.listdir('/dev/serial/by-path/'):
+                fname = '/dev/serial/by-path/' + fname
+                if realname == os.path.realpath(fname):
+                    return fname
+    return None
 
 # XXX - The current gcode is temporary.  Need to determine
 # the appropriate action the printer and MMU should take
@@ -72,7 +107,6 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
         try:
             self.last_state = int(self.mmu.send_command("READ_FINDA")[:-2])
         except self.gcode.error:
-            logging.exception(str(e))
             logging.exception("mmu2s: error reading Finda, cannot initialize")
             return False
         waketime = self.reactor.monotonic() + self.FINDA_REFRESH_TIME
@@ -84,7 +118,6 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
         try:
             finda_val = int(self.mmu.send_command("READ_FINDA")[:-2])
         except self.gcode.error:
-            logging.exception(str(e))
             logging.exception("mmu2s: error reading Finda, stopping timer")
             return self.reactor.NEVER
         if finda_val == self.last_state:
@@ -136,23 +169,15 @@ class MMU2Serial:
         self.response_cb = resp_callback
         self.partial_response = ""
         self.fd_handle = self.fd = None
-    def _detect_port(self):
-        for fname in os.listdir('/dev/serial/by-id/'):
-            if "MK3_Multi_Material_2.0" in fname:
-                fname = '/dev/serial/by-id/' + fname
-                realname = os.path.realpath(fname)
-                for fname in os.listdir('/dev/serial/by-path/'):
-                    fname = '/dev/serial/by-path/' + fname
-                    if realname == os.path.realpath(fname):
-                        self.port = fname
-                        return
-        raise self.gcode.error("mmu2s: Unable to detect serial port")
     def connect(self, eventtime):
         logging.info("Starting MMU2S connect")
         if self.autodetect:
-            self._detect_port()
-        if not self._check_bootloader():
-            raise self.gcode.error("mmu2s: unable to find mmu2 device")
+            self.port = detect_mmu_port()
+            if self.port is None:
+                raise self.gcode.error(
+                    "mmu2s: Unable to autodetect serial port for MMU device")
+        if not self._wait_for_program():
+            raise self.gcode.error("mmu2s: unable to find mmu2s device")
         start_time = self.reactor.monotonic()
         while 1:
             connect_time = self.reactor.monotonic()
@@ -172,24 +197,22 @@ class MMU2Serial:
         self.fd_handle = self.reactor.register_fd(
             self.fd, self._handle_mmu_recd)
         logging.info("MMU2S connected")
-    def _check_bootloader(self):
+    def _wait_for_program(self):
+        # Waits until the device program is loaded, pausing
+        # if bootloader is detected
         timeout = 10.
         pause_time = .1
         logged = False
         while timeout > 0.:
-            ttyname = os.path.realpath(self.port)
-            for fname in os.listdir('/dev/serial/by-id/'):
-                fname = '/dev/serial/by-id/' + fname
-                if os.path.realpath(fname) == ttyname and \
-                        "Multi_Material" in fname:
-                    if "bootloader" in fname:
-                        if not logged:
-                            logging.info("mmu2s: Waiting to exit bootloader")
-                            logged = True
-                        break
-                    else:
-                        logging.info("mmu2s: Device found on %s" % fname)
-                        return True
+            status = check_bootloader(self.port)
+            if status is True:
+                if not logged:
+                    logging.info("mmu2s: Waiting to exit bootloader")
+                    logged = True
+                break
+            elif status is False:
+                logging.info("mmu2s: Device found on %s" % self.port)
+                return True
             self.reactor.pause(self.reactor.monotonic() + pause_time)
             timeout -= pause_time
         logging.info("mmu2s: No device detected")
@@ -233,7 +256,7 @@ class MMU2Serial:
             while retries:
                 try:
                     self.ser.write(data)
-                except serial.SerialException as e:
+                except serial.SerialException:
                     logging.warn("MMU2S disconnected")
                     self.disconnect()
                 curtime = self.reactor.monotonic()
@@ -290,6 +313,8 @@ class MMU2S:
         self.gcode.register_command(
             "MMU_READ_IR", self.cmd_MMU_READ_IR)
         self.gcode.register_command(
+            "MMU_FLASH_FIRMWARE", self.cmd_MMU_FLASH_FIRMWARE)
+        self.gcode.register_command(
             "MMU_RESET", self.cmd_MMU_RESET)
         self.printer.register_event_handler(
             "klippy:ready", self._handle_ready)
@@ -321,6 +346,7 @@ class MMU2S:
         connect_time = reactor.monotonic() + 5.
         reactor.register_callback(self.mmu_serial.connect, connect_time)
     def _handle_disconnect(self, print_time=0.):
+        self.mmu_ready = False
         self.finda.stop_query()
         self.mmu_serial.disconnect()
     def _hardware_reset(self):
@@ -357,20 +383,63 @@ class MMU2S:
                   "Build Number: %s\nDrive Errors:%s\n")
         self.gcode.respond_info(status % (ack, version, build, errors))
     def cmd_MMU_SET_STEALTH(self, params):
-        mode = self.gcode.get_into('MODE', params)
+        mode = self.gcode.get_int('MODE', params, minval=0, maxval=1)
         self.send_command("SET_TMC_MODE", mode)
     def cmd_MMU_READ_IR(self, params):
         ir_status = int(self.ir_sensor.get_idler_state())
         self.gcode.respond_info("mmu2s: IR Sensor Status = [%d]" % ir_status)
     def cmd_MMU_RESET(self, params):
-        self.mmu_ready = False
-        self.finda.stop_query()
-        self.mmu_serial.disconnect()
+        self._handle_disconnect()
         reactor = self.printer.get_reactor()
         # Give 5 seconds for the device reset
         self._hardware_reset()
         connect_time = reactor.monotonic() + 5.
         reactor.register_callback(self.mmu_serial.connect, connect_time)
+    def cmd_MMU_FLASH_FIRMWARE(self, params):
+        # XXX = get the toolhead object and make sure we arent
+        # printing before proceeding
+        reactor = self.printer.get_reactor()
+        toolhead = self.printer.lookup_object('toolhead')
+        if toolhead.get_status(reactor.monotonic())['status'] == "Printing":
+            self.gcode.respond_info(
+                "mmu2s: cannot update firmware while printing")
+            return
+        avrd_cmd = ["avrdude", "-p", " atmega32u4", "-c", "avr109"]
+        fname = self.gcode.get_str("FILE", params)
+        if fname[-3:] != "hex":
+            self.gcode.respond_info(
+                "mmu2s: File does not appear to be a valid hex: %s" % (fname))
+            return
+        if fname.startswith('~'):
+            fname = os.path.expanduser(fname)
+        if os.path.exists(fname):
+            if self.mmu_serial.autodetect:
+                port = detect_mmu_port()
+            else:
+                port = self.mmu_serial.port
+            try:
+                ttyname = os.path.realpath(port)
+            except:
+                self.gcode.respond_info(
+                    "mmu2s: unable to find mmu2s device on port: %s" % (port))
+                return
+            avrd_cmd += ["-P", ttyname, "-D", "-U", "flash:w:%s:i" % (fname)]
+            self._handle_disconnect()
+            self._hardware_reset()
+            timeout = 5
+            while timeout:
+                reactor.pause(reactor.monotonic() + 1.)
+                if check_bootloader(port):
+                    # Bootloader found, run avrdude
+                    for line in run_command(avrd_cmd):
+                        self.gcode.respond_info(line)
+                    return
+                timeout -= 1
+            self.gcode.respond_info("mmu2s: unable to enter mmu2s bootloader")
+        else:
+            self.gcode.respond_info(
+                "mmu2s: Cannot find firmware file: %s" % (fname))
+
 
 def load_config(config):
     return MMU2S(config)

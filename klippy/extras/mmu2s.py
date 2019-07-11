@@ -8,7 +8,6 @@ import os
 import subprocess
 import logging
 import serial
-import threading
 import filament_switch_sensor
 
 MMU2_BAUD = 115200
@@ -174,10 +173,12 @@ class MMU2Serial:
         if self.autodetect:
             self.port = detect_mmu_port()
             if self.port is None:
-                raise self.gcode.error(
+                logging.info(
                     "mmu2s: Unable to autodetect serial port for MMU device")
+                return
         if not self._wait_for_program():
-            raise self.gcode.error("mmu2s: unable to find mmu2s device")
+            logging.info("mmu2s: unable to find mmu2s device")
+            return
         start_time = self.reactor.monotonic()
         while 1:
             connect_time = self.reactor.monotonic()
@@ -188,7 +189,7 @@ class MMU2Serial:
                     self.port, MMU2_BAUD, stopbits=serial.STOPBITS_TWO,
                     timeout=0, exclusive=True)
             except (OSError, IOError, serial.SerialException) as e:
-                logging.warn("Unable to MMU2S port: %s", e)
+                logging.exception("Unable to MMU2S port: %s", e)
                 self.reactor.pause(connect_time + 5.)
                 continue
             break
@@ -205,11 +206,9 @@ class MMU2Serial:
         logged = False
         while timeout > 0.:
             status = check_bootloader(self.port)
-            if status is True:
-                if not logged:
-                    logging.info("mmu2s: Waiting to exit bootloader")
-                    logged = True
-                break
+            if status is True and not logged:
+                logging.info("mmu2s: Waiting to exit bootloader")
+                logged = True
             elif status is False:
                 logging.info("mmu2s: Device found on %s" % self.port)
                 return True
@@ -246,6 +245,17 @@ class MMU2Serial:
                     self.response_cb(line)
             if ack_count > 1:
                 logging.warn("mmu2s: multiple acknowledgements recd")
+    def send(self, data):
+        with self.mutex:
+            if not self.connected:
+                raise self.gcode.error(
+                    "mmu2s: mmu disconnected, cannot send command %s" %
+                    str(data[:-1]))
+            try:
+                self.ser.write(data)
+            except serial.SerialException:
+                logging.warn("MMU2S disconnected")
+                self.disconnect()
     def send_with_response(self, data, timeout=RESPONSE_TIMEOUT, retries=2):
         with self.mutex:
             if not self.connected:
@@ -396,23 +406,22 @@ class MMU2S:
         connect_time = reactor.monotonic() + 5.
         reactor.register_callback(self.mmu_serial.connect, connect_time)
     def cmd_MMU_FLASH_FIRMWARE(self, params):
-        # XXX = get the toolhead object and make sure we arent
-        # printing before proceeding
         reactor = self.printer.get_reactor()
         toolhead = self.printer.lookup_object('toolhead')
         if toolhead.get_status(reactor.monotonic())['status'] == "Printing":
             self.gcode.respond_info(
                 "mmu2s: cannot update firmware while printing")
             return
-        avrd_cmd = ["avrdude", "-p", " atmega32u4", "-c", "avr109"]
+        avrd_cmd = ["avrdude", "-p", "atmega32u4", "-c", "avr109"]
         fname = self.gcode.get_str("FILE", params)
-        if fname[-3:] != "hex":
+        if fname[-4:] != ".hex":
             self.gcode.respond_info(
                 "mmu2s: File does not appear to be a valid hex: %s" % (fname))
             return
         if fname.startswith('~'):
             fname = os.path.expanduser(fname)
         if os.path.exists(fname):
+            # Firmware file found, attempt to locate MMU2S port and flash
             if self.mmu_serial.autodetect:
                 port = detect_mmu_port()
             else:

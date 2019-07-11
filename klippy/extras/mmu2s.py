@@ -113,7 +113,8 @@ class IdlerSensor:
 
 class MMU2Serial:
     def __init__(self, config, notifcation_cb):
-        self.port = config.get('serial').strip()
+        self.port = config.get('serial', None)
+        self.autodetect = self.port is None
         printer = config.get_printer()
         self.reactor = printer.get_reactor()
         self.gcode = printer.lookup_object('gcode')
@@ -124,8 +125,17 @@ class MMU2Serial:
         self.notifcation_cb = notifcation_cb
         self.partial_response = ""
         self.fd_handle = self.fd = None
+    def _detect_port(self):
+        for fname in os.listdir('/dev/serial/by-id/'):
+            if "MK3_Multi_Material_2.0" in fname:
+                fname = '/dev/serial/by-id/' + fname
+                self.port = os.path.realpath(fname)
+                return
+        raise self.gcode.error("mmu2s: Unable to detect serial port")
     def connect(self, eventtime):
         logging.info("Starting MMU2S connect")
+        if self.autodetect:
+            self.port = self._detect_port()
         self._check_bootloader()
         start_time = self.reactor.monotonic()
         while 1:
@@ -234,8 +244,8 @@ class MMU2Serial:
                     return resp
                 retries -= 1
             raise self.gcode.error(
-                    "mmu2s: no acknowledgment for command %s" %
-                    (str(data[:-1])))
+                "mmu2s: no acknowledgment for command %s" %
+                (str(data[:-1])))
 
 class MMU2S:
     def __init__(self, config):
@@ -261,6 +271,8 @@ class MMU2S:
             "MMU_SET_TMC", self.cmd_MMU_SET_TMC)
         self.gcode.register_command(
             "MMU_READ_IR", self.cmd_MMU_READ_IR)
+        self.gcode.register_command(
+            "MMU_RESET", self.cmd_MMU_RESET)
         self.printer.register_event_handler(
             "klippy:ready", self._handle_ready)
         self.printer.register_event_handler(
@@ -325,6 +337,12 @@ class MMU2S:
     def cmd_MMU_READ_IR(self, params):
         ir_status = self.ir_sensor.get_idler_state()
         self.gcode.respond_info("mmu2s: IR Sensor Status = [%d]" % ir_status)
+    def cmd_MMU_RESET(self, params):
+        self.finda.stop_query()
+        self.mmu_serial.disconnect()
+        reactor = self.printer.get_reactor()
+        connect_time = self._hardware_reset()
+        reactor.register_callback(self.mmu_serial.connect, connect_time)
 
 def load_config(config):
     return MMU2S(config)

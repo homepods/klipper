@@ -69,13 +69,24 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
             self.cmd_SET_FILAMENT_SENSOR,
             desc=self.cmd_SET_FILAMENT_SENSOR_help)
     def start_query(self):
-        self.last_state = int(self.mmu.send_command("READ_FINDA")[:-2])
+        try:
+            self.last_state = int(self.mmu.send_command("READ_FINDA")[:-2])
+        except self.gcode.error:
+            logging.exception(str(e))
+            logging.exception("mmu2s: error reading Finda, cannot initialize")
+            return False
         waketime = self.reactor.monotonic() + self.FINDA_REFRESH_TIME
         self.reactor.update_timer(self.query_timer, waketime)
+        return True
     def stop_query(self):
         self.reactor.update_timer(self.query_timer, self.reactor.NEVER)
     def _finda_event(self, eventtime):
-        finda_val = int(self.mmu.send_command("READ_FINDA")[:-2])
+        try:
+            finda_val = int(self.mmu.send_command("READ_FINDA")[:-2])
+        except self.gcode.error:
+            logging.exception(str(e))
+            logging.exception("mmu2s: error reading Finda, stopping timer")
+            return self.reactor.NEVER
         if finda_val == self.last_state:
             return
         if not finda_val:
@@ -112,7 +123,7 @@ class IdlerSensor:
         return self.last_state
 
 class MMU2Serial:
-    def __init__(self, config, notifcation_cb):
+    def __init__(self, config, resp_callback):
         self.port = config.get('serial', None)
         self.autodetect = self.port is None
         printer = config.get_printer()
@@ -122,7 +133,7 @@ class MMU2Serial:
         self.connected = False
         self.mmu_response = None
         self.mutex = self.reactor.mutex()
-        self.notifcation_cb = notifcation_cb
+        self.response_cb = resp_callback
         self.partial_response = ""
         self.fd_handle = self.fd = None
     def _detect_port(self):
@@ -140,12 +151,13 @@ class MMU2Serial:
         logging.info("Starting MMU2S connect")
         if self.autodetect:
             self._detect_port()
-        self._check_bootloader()
+        if not self._check_bootloader():
+            raise self.gcode.error("mmu2s: unable to find mmu2 device")
         start_time = self.reactor.monotonic()
         while 1:
             connect_time = self.reactor.monotonic()
             if connect_time > start_time + 90.:
-                raise error("Unable to connect to MMU2s")
+                raise self.gcode.error("mmu2s: Unable to connect to MMU2s")
             try:
                 self.ser = serial.Serial(
                     self.port, MMU2_BAUD, stopbits=serial.STOPBITS_TWO,
@@ -162,6 +174,7 @@ class MMU2Serial:
         logging.info("MMU2S connected")
     def _check_bootloader(self):
         timeout = 10.
+        pause_time = .1
         logged = False
         while timeout > 0.:
             ttyname = os.path.realpath(self.port)
@@ -175,9 +188,10 @@ class MMU2Serial:
                             logged = True
                         break
                     else:
+                        logging.info("mmu2s: Device found on %s" % fname)
                         return True
-            self.reactor.pause(self.reactor.monotonic() + .1)
-            timeout -= .1
+            self.reactor.pause(self.reactor.monotonic() + pause_time)
+            timeout -= pause_time
         logging.info("mmu2s: No device detected")
         return False
     def disconnect(self):
@@ -206,8 +220,7 @@ class MMU2Serial:
                     ack_count += 1
                 else:
                     # Transfer initiated by MMU
-                    logging.info("mmu2s: mmu initiated transfer: %s", line)
-                    self.notifcation_cb(line)
+                    self.response_cb(line)
             if ack_count > 1:
                 logging.warn("mmu2s: multiple acknowledgements recd")
     def send_with_response(self, data, timeout=RESPONSE_TIMEOUT, retries=2):
@@ -263,7 +276,7 @@ class MMU2S:
             'digital_out', config.get('reset_pin'))
         self.reset_pin.setup_max_duration(0.)
         self.reset_pin.setup_start_value(1, 1)
-        self.mmu_serial = MMU2Serial(config, self.mmu_notification)
+        self.mmu_serial = MMU2Serial(config, self._response_cb)
         self.finda = FindaSensor(config, self)
         self.ir_sensor = IdlerSensor(config)
         self.mmu_ready = False
@@ -273,7 +286,7 @@ class MMU2S:
         self.gcode.register_command(
             "MMU_GET_STATUS", self.cmd_MMU_GET_STATUS)
         self.gcode.register_command(
-            "MMU_SET_TMC", self.cmd_MMU_SET_TMC)
+            "MMU_SET_STEALTH", self.cmd_MMU_SET_STEALTH)
         self.gcode.register_command(
             "MMU_READ_IR", self.cmd_MMU_READ_IR)
         self.gcode.register_command(
@@ -283,7 +296,7 @@ class MMU2S:
         self.printer.register_event_handler(
             "klippy:disconnect", self._handle_disconnect)
         self.printer.register_event_handler(
-            "gcode:request_restart", self._handle_restart)
+            "gcode:request_restart", self._handle_disconnect)
     def send_command(self, cmd, reqtype=None):
         if cmd not in MMU_COMMANDS:
             raise self.gcode.error("mmu2s: Unknown MMU Command %s" % (cmd))
@@ -292,19 +305,22 @@ class MMU2S:
             command = command % (reqtype)
         outbytes = bytes(command + '\n')
         if 'P' in command:
-            return self.mmu_serial.send_with_response(outbytes, timeout=3.)
+            timeout = 3.
         else:
-            return self.mmu_serial.send_with_response(outbytes)
+            timeout = RESPONSE_TIMEOUT
+        try:
+            resp = self.mmu_serial.send_with_response(
+                outbytes, timeout=timeout)
+        except self.gcode.error:
+            self.mmu_ready = False
+            raise
+        return resp
     def _handle_ready(self):
         reactor = self.printer.get_reactor()
         self._hardware_reset()
-        # Give 5 seconds for the device reset
         connect_time = reactor.monotonic() + 5.
         reactor.register_callback(self.mmu_serial.connect, connect_time)
-    def _handle_restart(self, print_time):
-        self.finda.stop_query()
-        self.mmu_serial.disconnect()
-    def _handle_disconnect(self):
+    def _handle_disconnect(self, print_time=0.):
         self.finda.stop_query()
         self.mmu_serial.disconnect()
     def _hardware_reset(self):
@@ -313,12 +329,14 @@ class MMU2S:
         self.reset_pin.set_digital(print_time, 0)
         print_time = max(print_time + .1, toolhead.get_last_move_time())
         self.reset_pin.set_digital(print_time, 1)
-    def mmu_notification(self, data):
-        self.gcode.respond_info("mmu2s: Notification received\n %s", data)
+    def _response_cb(self, data):
         if data == "start":
-            self.mmu_ready = True
-            self.gcode.respond_info("mmu2s: connected and ready")
-            self.finda.start_query()
+            self.mmu_ready = self.finda.start_query()
+            if self.mmu_ready:
+                self.gcode.respond_info("mmu2s: mmu ready for commands")
+        else:
+            self.gcode.respond_info(
+                "mmu2s: unknown transfer from mmu\n%s" % data)
     def change_tool(self, index):
         pass
     def cmd_T_SPECIAL(self, params):
@@ -338,13 +356,14 @@ class MMU2S:
         status = ("MMU Status:\nAcknowledge Test: %s\nVersion: %s\n" +
                   "Build Number: %s\nDrive Errors:%s\n")
         self.gcode.respond_info(status % (ack, version, build, errors))
-    def cmd_MMU_SET_TMC(self, params):
+    def cmd_MMU_SET_STEALTH(self, params):
         mode = self.gcode.get_into('MODE', params)
         self.send_command("SET_TMC_MODE", mode)
     def cmd_MMU_READ_IR(self, params):
         ir_status = int(self.ir_sensor.get_idler_state())
         self.gcode.respond_info("mmu2s: IR Sensor Status = [%d]" % ir_status)
     def cmd_MMU_RESET(self, params):
+        self.mmu_ready = False
         self.finda.stop_query()
         self.mmu_serial.disconnect()
         reactor = self.printer.get_reactor()

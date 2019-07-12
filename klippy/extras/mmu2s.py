@@ -143,14 +143,24 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
         self.sensor_enabled = self.gcode.get_int("ENABLE", params, 1)
 
 class IdlerSensor:
-    def __init__(self, config):
+    def __init__(self, config, mmu2s):
         pin = config.get('idler_sensor_pin')
         printer = config.get_printer()
         buttons = printer.try_load_module(config, 'buttons')
         buttons.register_buttons([pin], self._button_handler)
+        self.mmu2s = mmu2s
         self.last_state = False
+        self.mmu_loading = False
     def _button_handler(self, eventtime, status):
+        if status == self.last_state:
+            return
+        if status and self.mmu_loading:
+            # Transition from false to true, notifiy MMU its time to abort
+            self.mmu_loading = False
+            self.mmu2s.abort_loading()
         self.last_state = status
+    def set_mmu_loading(self, is_loading):
+        self.mmu_loading = is_loading
     def get_idler_state(self):
         return self.last_state
 
@@ -311,8 +321,9 @@ class MMU2S:
         self.reset_pin.setup_start_value(1, 1)
         self.mmu_serial = MMU2Serial(config, self._response_cb)
         self.finda = FindaSensor(config, self)
-        self.ir_sensor = IdlerSensor(config)
+        self.ir_sensor = IdlerSensor(config, self)
         self.mmu_ready = False
+        self.version = self.build_number = 0
         self.current_extruder = 0
         for t_cmd in ["Tx, Tc, T?"]:
             self.gcode.register_command(t_cmd, self.cmd_T_SPECIAL)
@@ -350,6 +361,9 @@ class MMU2S:
             self.mmu_ready = False
             raise
         return resp
+    def abort_loading(self):
+        self.mmu_serial.send(b'A')
+        # XXX - notify loading loop its time to exit
     def _handle_ready(self):
         reactor = self.printer.get_reactor()
         self._hardware_reset()
@@ -368,12 +382,29 @@ class MMU2S:
     def _response_cb(self, data):
         if data == "start":
             self.mmu_ready = self.finda.start_query()
+            self.version = int(self.send_command("GET_VERSION")[:-2])
+            self.build_number = int(self.send_command("GET_BUILD_NUMBER")[:-2])
             if self.mmu_ready:
-                self.gcode.respond_info("mmu2s: mmu ready for commands")
+                version = ".".join(str(self.version))
+                self.gcode.respond_info(
+                    "mmu2s: mmu ready, Firmware Version: %s Build Number: %d" %
+                    (version, self.build_number))
         else:
             self.gcode.respond_info(
                 "mmu2s: unknown transfer from mmu\n%s" % data)
     def change_tool(self, index):
+        # XXX - Steps to change tool
+        # 1) Check to see if autodeplete is enabled.  If so, get the next
+        # available tool rather than using the supplied index
+        # 2) Check to make sure filament isn't already loaded in the new tool
+        # 3) Cut filament if cutter is enable.   This does an unload, so
+        # its functionality overlaps with 4
+        # 4) Send MMU T0 command, wait for okay response.   Check idler sensor, if
+        # filament is present  we first unload
+        # filament by backing the extruder gears 38.04mm at 19.02mm/s.  Delay 2s.
+        # Then start moving the gears forward in 1.902 mm increments at 19.02mm/s.  
+        # Do this until either the idler sensor triggers or the mmu returns ok
+        # 6) Send MMU C0 command if idler sensor is not detected.  
         pass
     def cmd_T_SPECIAL(self, params):
         # Hand T commands followed by special characters (x, c, ?)

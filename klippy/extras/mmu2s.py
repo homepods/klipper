@@ -80,6 +80,7 @@ M117 Finda Runout Detected
 
 class FindaSensor(filament_switch_sensor.BaseSensor):
     EVENT_DELAY = 3.
+    FINDA_RETRY_TIME = 3.
     FINDA_REFRESH_TIME = .3
     def __init__(self, config, mmu):
         super(FindaSensor, self).__init__(config)
@@ -90,7 +91,7 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
         gcode_macro = self.printer.try_load_module(config, 'gcode_macro')
         self.runout_gcode = gcode_macro.load_template(
             config, 'runout_gcode', FINDA_GCODE)
-        self.last_state = False
+        self.last_state = 0
         self.last_event_time = 0.
         self.query_timer = self.reactor.register_timer(self._finda_event)
         self.sensor_enabled = True
@@ -103,10 +104,9 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
             self.cmd_SET_FILAMENT_SENSOR,
             desc=self.cmd_SET_FILAMENT_SENSOR_help)
     def start_query(self):
-        try:
-            self.last_state = int(self.mmu.send_command("READ_FINDA")[:-2])
-        except self.gcode.error:
-            logging.exception("mmu2s: error reading Finda, cannot initialize")
+        self.last_state = self.mmu.send_command("READ_FINDA")
+        if self.last_state < 0:
+            logging.info("mmu2s: error reading Finda, cannot initialize")
             return False
         waketime = self.reactor.monotonic() + self.FINDA_REFRESH_TIME
         self.reactor.update_timer(self.query_timer, waketime)
@@ -114,25 +114,24 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
     def stop_query(self):
         self.reactor.update_timer(self.query_timer, self.reactor.NEVER)
     def _finda_event(self, eventtime):
-        try:
-            finda_val = int(self.mmu.send_command("READ_FINDA")[:-2])
-        except self.gcode.error:
-            logging.exception("mmu2s: error reading Finda, stopping timer")
-            return self.reactor.NEVER
-        if finda_val == self.last_state:
-            return
-        if not finda_val:
-            # transition from filament present to not present
-            if (self.runout_enabled and self.sensor_enabled and
-                    (eventtime - self.last_event_time) > self.EVENT_DELAY):
-                # Filament runout detected
-                self.last_event_time = eventtime
-                logging.info(
-                    "switch_sensor: runout event detected, Time %.2f",
-                    eventtime)
-                self.reactor.register_callback(self._runout_event_handler)
+        finda_val = self.mmu.send_command("READ_FINDA")
+        # There is a roundtrip delay when performing reads, so fetch
+        # current monotonic time
+        curtime = self.reactor.monotonic()
+        if finda_val < 0:
+            # Error retreiving finda, try again in 3 seconds
+            return curtime + self.FINDA_RETRY_TIME
+        if finda_val != self.last_state:
+            # Transition of state, check value
+            if not finda_val:
+                # transition from filament present to not present
+                if (self.runout_enabled and self.sensor_enabled and
+                        (curtime - self.last_event_time) > self.EVENT_DELAY):
+                    # Filament runout detected
+                    self.last_event_time = curtime
+                    self.reactor.register_callback(self._runout_event_handler)
         self.last_state = finda_val
-        return eventtime + self.FINDA_REFRESH_TIME
+        return curtime + self.FINDA_REFRESH_TIME
     def cmd_QUERY_FILAMENT_SENSOR(self, params):
         if self.last_state:
             msg = "Finda: filament detected"
@@ -165,6 +164,8 @@ class IdlerSensor:
         return self.last_state
 
 class MMU2Serial:
+    DISCONNECT_MSG = "mmu2s: mmu disconnected, cannot send command %s"
+    NACK_MSG = "mmu2s: no acknowledgment for command %s"
     def __init__(self, config, resp_callback):
         self.port = config.get('serial', None)
         self.autodetect = self.port is None
@@ -174,7 +175,6 @@ class MMU2Serial:
         self.ser = None
         self.connected = False
         self.mmu_response = None
-        self.mutex = self.reactor.mutex()
         self.response_cb = resp_callback
         self.partial_response = ""
         self.fd_handle = self.fd = None
@@ -193,6 +193,7 @@ class MMU2Serial:
         while 1:
             connect_time = self.reactor.monotonic()
             if connect_time > start_time + 90.:
+                # Give 90 second timeout, then raise error.
                 raise self.gcode.error("mmu2s: Unable to connect to MMU2s")
             try:
                 self.ser = serial.Serial(
@@ -256,57 +257,54 @@ class MMU2Serial:
             if ack_count > 1:
                 logging.warn("mmu2s: multiple acknowledgements recd")
     def send(self, data):
-        with self.mutex:
-            if not self.connected:
-                raise self.gcode.error(
-                    "mmu2s: mmu disconnected, cannot send command %s" %
-                    str(data[:-1]))
+        if self.connected:
             try:
                 self.ser.write(data)
             except serial.SerialException:
                 logging.warn("MMU2S disconnected")
                 self.disconnect()
-    def send_with_response(self, data, timeout=RESPONSE_TIMEOUT, send_attempts=1):
-        with self.mutex:
-            if not self.connected:
-                raise self.gcode.error(
-                    "mmu2s: mmu disconnected, cannot send command %s" %
-                    str(data[:-1]))
-            self.mmu_response = None
-            while send_attempts:
-                try:
-                    self.ser.write(data)
-                except serial.SerialException:
-                    logging.warn("MMU2S disconnected")
-                    self.disconnect()
-                curtime = self.reactor.monotonic()
-                last_resp_time = curtime
-                endtime = curtime + timeout
-                while self.mmu_response is None:
-                    if not self.connected:
-                        raise self.gcode.error(
-                            "mmu2s: mmu disconnected, cannot send command %s" %
-                            str(data[:-1]))
-                    if curtime >= endtime:
-                        break
-                    curtime = self.reactor.pause(curtime + .01)
-                    if curtime - last_resp_time >= 2.:
-                        self.gcode.respond_info(
-                            "mmu2s: waiting for response, %.2fs remaining" %
-                            (endtime - curtime))
-                        last_resp_time = curtime
-                else:
-                    # command acknowledge, response recd
-                    resp = self.mmu_response
-                    self.mmu_response = None
-                    return resp
-                send_attempts -= 1
-                if send_attempts:
+        else:
+            self.error_msg = self.DISCONNECT_MSG % str(data[:-1])
+    def send_with_response(self, data, timeout=RESPONSE_TIMEOUT,
+                           send_attempts=1):
+        # Sends data and waits for acknowledgement.  Returns a tuple,
+        # The first value a boolean indicating success, the second is
+        # the payload if successful, or an error message if the request
+        # failed
+        if not self.connected:
+            return False, self.DISCONNECT_MSG % str(data[:-1])
+        self.mmu_response = None
+        while send_attempts:
+            try:
+                self.ser.write(data)
+            except serial.SerialException:
+                logging.warn("MMU2S disconnected")
+                self.disconnect()
+            curtime = self.reactor.monotonic()
+            last_resp_time = curtime
+            endtime = curtime + timeout
+            while self.mmu_response is None:
+                if not self.connected:
+                    return False, self.DISCONNECT_MSG % str(data[:-1])
+                if curtime >= endtime:
+                    break
+                curtime = self.reactor.pause(curtime + .01)
+                if curtime - last_resp_time >= 2.:
                     self.gcode.respond_info(
-                        "mmu2s: retrying command %s" % (str(data[:-1])))
-            raise self.gcode.error(
-                "mmu2s: no acknowledgment for command %s" %
-                (str(data[:-1])))
+                        "mmu2s: waiting for response, %.2fs remaining" %
+                        (endtime - curtime))
+                    last_resp_time = curtime
+            else:
+                # command acknowledged, response recd
+                resp = self.mmu_response
+                self.mmu_response = None
+                return True, resp
+            send_attempts -= 1
+            if send_attempts:
+                self.gcode.respond_info(
+                    "mmu2s: retrying command %s" % (str(data[:-1])))
+        self.error_msg = self.NACK_MSG % str(data[:-1])
+        return False, self.DISCONNECT_MSG % str(data[:-1])
 
 # Handles load/store to local persistent storage
 class MMUStorage:
@@ -387,10 +385,10 @@ class MMU2USBControl:
 
 # XXX - Class containing test gcodes for MMU, to be remove
 class MMUTest:
-    def __init(self, mmu):
+    def __init__(self, mmu):
         self.send_command = mmu.send_command
         self.gcode = mmu.gcode
-        self.ir_sensor = mmu.irsensor
+        self.ir_sensor = mmu.ir_sensor
         self.gcode.register_command(
             "MMU_GET_STATUS", self.cmd_MMU_GET_STATUS)
         self.gcode.register_command(
@@ -398,12 +396,12 @@ class MMUTest:
         self.gcode.register_command(
             "MMU_READ_IR", self.cmd_MMU_READ_IR)
     def cmd_MMU_GET_STATUS(self, params):
-        ack = self.send_command("CHECK_ACK")
-        version = self.send_command("GET_VERSION")[:-2]
-        build = self.send_command("GET_BUILD_NUMBER")[:-2]
-        errors = self.send_command("GET_DRIVE_ERRORS")[:-2]
-        status = ("MMU Status:\nAcknowledge Test: %s\nVersion: %s\n" +
-                  "Build Number: %s\nDrive Errors:%s\n")
+        ack = (self.send_command("CHECK_ACK") == 0)
+        version = self.send_command("GET_VERSION")
+        build = self.send_command("GET_BUILD_NUMBER")
+        errors = self.send_command("GET_DRIVE_ERRORS")
+        status = ("MMU Status:\nAcknowledge Test: %d\nVersion: %d\n" +
+                  "Build Number: %d\nDrive Errors:%d\n")
         self.gcode.respond_info(status % (ack, version, build, errors))
     def cmd_MMU_SET_STEALTH(self, params):
         mode = self.gcode.get_int('MODE', params, minval=0, maxval=1)
@@ -416,12 +414,14 @@ class MMU2S:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
+        self.mutex = self.printer.get_reactor().mutex()
         self.mmu_serial = MMU2Serial(config, self._mmu_serial_event)
         self.finda = FindaSensor(config, self)
         self.ir_sensor = IdlerSensor(config, self)
         self.mmu_usb_ctrl = MMU2USBControl(config, self)
         self.mmu_ready = False
         self.version = self.build_number = 0
+        self.cmd_acknowledged = False
         self.current_extruder = 0
         for t_cmd in ["Tx, Tc, T?"]:
             self.gcode.register_command(t_cmd, self.cmd_T_SPECIAL)
@@ -436,8 +436,8 @@ class MMU2S:
     def _mmu_serial_event(self, data):
         if data == "start":
             self.mmu_ready = self.finda.start_query()
-            self.version = int(self.send_command("GET_VERSION")[:-2])
-            self.build_number = int(self.send_command("GET_BUILD_NUMBER")[:-2])
+            self.version = self.send_command("GET_VERSION")
+            self.build_number = self.send_command("GET_BUILD_NUMBER")
             if self.mmu_ready:
                 version = ".".join(str(self.version))
                 self.gcode.respond_info(
@@ -458,23 +458,31 @@ class MMU2S:
     def send_command(self, cmd, reqtype=None):
         if cmd not in MMU_COMMANDS:
             raise self.gcode.error("mmu2s: Unknown MMU Command %s" % (cmd))
-        command = MMU_COMMANDS[cmd]
-        if reqtype is not None:
-            command = command % (reqtype)
-        outbytes = bytes(command + '\n')
-        if 'P' in command:
-            timeout = 3.
-        else:
-            timeout = RESPONSE_TIMEOUT
-        try:
-            resp = self.mmu_serial.send_with_response(
+        with self.mutex:
+            self.cmd_acknowledged = False
+            command = MMU_COMMANDS[cmd]
+            if reqtype is not None:
+                command = command % (reqtype)
+            outbytes = bytes(command + '\n')
+            if 'P' in command:
+                timeout = 3.
+            else:
+                timeout = RESPONSE_TIMEOUT
+            self.cmd_acknowledged, data = self.mmu_serial.send_with_response(
                 outbytes, timeout=timeout)
-        except self.gcode.error:
-            self.mmu_ready = False
-            raise
-        return resp
+            ret = 0
+            if not self.cmd_acknowledged:
+                self.gcode.respond_info(data)
+                ret = -1
+            elif len(data) > 2:
+                try:
+                    ret = int(data[:-2])
+                except:
+                    ret = 0
+            return ret
     def abort_loading(self):
-        self.mmu_serial.send(b'A')
+        with self.mutex:
+            self.mmu_serial.send(b'A')
         # XXX - notify loading loop its time to exit
     def change_tool(self, index):
         # XXX - Steps to change tool

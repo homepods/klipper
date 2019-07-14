@@ -171,7 +171,7 @@ class MMU2Serial:
         self.autodetect = self.port is None
         printer = config.get_printer()
         self.reactor = printer.get_reactor()
-        self.send_completion = self.reactor.completion()
+        self.send_completion = None
         self.gcode = printer.lookup_object('gcode')
         self.ser = None
         self.connected = False
@@ -251,7 +251,11 @@ class MMU2Serial:
             for line in lines:
                 if "ok" in line:
                     # acknowledgement
-                    self.send_completion.complete(line)
+                    if self.send_completion is not None:
+                        self.send_completion.complete(line)
+                    else:
+                        # acknowledgement recevied without request
+                        self.response_cb(line)
                     ack_count += 1
                 else:
                     # Transfer initiated by MMU
@@ -267,18 +271,6 @@ class MMU2Serial:
                 self.disconnect()
         else:
             self.error_msg = self.DISCONNECT_MSG % str(data[:-1])
-    def wait_for_ack(self, timeout=RESPONSE_TIMEOUT, keepalive=True):
-        if not self.connected:
-            return False, self.DISCONNECT_MSG % ("WAIT")
-        waketime = self.reactor.monotonic() + timeout
-        if keepalive:
-                self.reactor.update_timer(
-                    self.keepalive_timer, self.reactor.monotonic() + 2.)
-        result = self.send_completion.wait(waketime)
-        self.reactor.update_timer(self.keepalive_timer, self.reactor.NEVER)
-        if result is not None:
-            return True, result
-        return False, self.NACK_MSG % ("WAIT")
     def send_with_response(self, data, timeout=RESPONSE_TIMEOUT,
                            send_attempts=1, keepalive=True):
         # Sends data and waits for acknowledgement.  Returns a tuple,
@@ -289,18 +281,20 @@ class MMU2Serial:
             return False, self.DISCONNECT_MSG % str(data[:-1])
         self.mmu_response = None
         while send_attempts:
+            self.send_completion = self.reactor.completion()
             try:
                 self.ser.write(data)
             except serial.SerialException:
                 logging.warn("MMU2S disconnected")
                 self.disconnect()
                 return False, self.DISCONNECT_MSG % str(data[:-1])
-            waketime = self.reactor.monotonic() + timeout
             if keepalive:
                 self.reactor.update_timer(
                     self.keepalive_timer, self.reactor.monotonic() + 2.)
-            result = self.send_completion.wait(waketime)
+            result = self.send_completion.wait(
+                self.reactor.monotonic() + timeout)
             self.reactor.update_timer(self.keepalive_timer, self.reactor.NEVER)
+            self.send_completion = None
             if result is not None:
                 return True, result
             send_attempts -= 1

@@ -545,10 +545,12 @@ class MMU2S:
             # Pause so callback can begin execution
             self.send_command_async("SET_TOOL", index)
             while self.ir_sensor.get_idler_state():
-                pass
-            # unload
+                reactor.pause(reactor.monotonic() + .1)
+                # XXX - Do unload(move to extruder unload?)
+            # XXX - probably need a pause here to turn off motor
             while not self.cmd_ack:
                 pass
+                # XXX - Do load
 
 
     def mmu_continue_loading(self):

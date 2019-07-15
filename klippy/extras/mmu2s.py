@@ -11,7 +11,7 @@ import serial
 import filament_switch_sensor
 
 MMU2_BAUD = 115200
-RESPONSE_TIMEOUT = 45.
+MMU_TIMEOUT = 45.
 
 MMU_COMMANDS = {
     "SET_TOOL": "T%d",
@@ -105,7 +105,8 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
             self.cmd_SET_FILAMENT_SENSOR,
             desc=self.cmd_SET_FILAMENT_SENSOR_help)
     def start_query(self):
-        self.last_state = self.mmu.send_command(self.finda_cmd)
+        self.last_state = self.mmu.send_command(
+            self.finda_cmd, timeout=3.)
         if self.last_state < 0:
             logging.info("mmu2s: error reading Finda, cannot initialize")
             return False
@@ -115,7 +116,8 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
     def stop_query(self):
         self.reactor.update_timer(self.query_timer, self.reactor.NEVER)
     def _finda_event(self, eventtime):
-        finda_val = self.mmu.send_command(self.finda_cmd)
+        finda_val = self.mmu.send_command(
+            self.finda_cmd, timeout=3.)
         # There is a roundtrip delay when performing reads, so fetch
         # current monotonic time
         curtime = self.reactor.monotonic()
@@ -263,8 +265,8 @@ class MMU2Serial:
                 self.disconnect()
         else:
             self.error_msg = self.DISCONNECT_MSG % str(data[:-1])
-    def send_with_response(self, data, timeout=RESPONSE_TIMEOUT,
-                           send_attempts=1, keepalive=True):
+    def send_with_response(self, data, timeout=MMU_TIMEOUT,
+                           retries=0, keepalive=True):
         # Sends data and waits for acknowledgement.  Returns a tuple,
         # The first value a boolean indicating success, the second is
         # the payload if successful, or an error message if the request
@@ -272,7 +274,7 @@ class MMU2Serial:
         if not self.connected:
             return False, self.DISCONNECT_MSG % str(data[:-1])
         self.mmu_response = None
-        while send_attempts:
+        while True:
             self.send_completion = self.reactor.completion()
             try:
                 self.ser.write(data)
@@ -289,10 +291,12 @@ class MMU2Serial:
             self.send_completion = None
             if result is not None:
                 return True, result
-            send_attempts -= 1
-            if send_attempts:
+            if retries:
+                retries -= 1
                 self.gcode.respond_info(
                     "mmu2s: retrying command %s" % (str(data[:-1])))
+            else:
+                break
         return False, self.NACK_MSG % str(data[:-1])
     def wait_for_user(self, keepalive=True):
         if not self.connected:
@@ -417,7 +421,7 @@ class MMUTest:
         responses[0] = responses[0] == 0
         status = ("MMU Status:\nAcknowledge Test: %d\nVersion: %d\n" +
                   "Build Number: %d\nDrive Errors:%d\n")
-        self.gcode.respond_info(status % responses)
+        self.gcode.respond_info(status % tuple(responses))
     def cmd_MMU_SET_STEALTH(self, params):
         mode = self.gcode.get_int('MODE', params, minval=0, maxval=1)
         cmd = self.get_cmd("SET_TMC_MODE")
@@ -465,6 +469,8 @@ class MMU2S:
             "klippy:disconnect", self.disconnect)
         self.printer.register_event_handler(
             "gcode:request_restart", self.disconnect)
+        self.printer.register_event_handler(
+            "klippy:shutdown", self.disconnect)
         # XXX - testing object, to be removed
         MMUTest(self)
     def _mmu_serial_event(self, data):
@@ -498,38 +504,27 @@ class MMU2S:
         if reqtype is not None:
             command = command % (reqtype)
         return bytes(command + '\n')
-    def send_command_async(self, cmd, send_attempts=1):
+    def send_command_async(self, cmd, timeout=MMU_TIMEOUT, retries=0):
         # Caller MUST acquire mutex
-        timeout = RESPONSE_TIMEOUT
-        if 'P' in cmd:
-            timeout = 3.
-        if 'W' in cmd:
-            timeout = self.reactor.NEVER
-        def send(eventtime, o=cmd, t=timeout, a=send_attempts):
+        def send(eventtime, o=cmd, t=timeout, r=retries):
             self.cmd_ack = False
-            self.cmd_resp = None
             self.cmd_ack, data = self.mmu_serial.send_with_response(
-                o, timeout=t, send_attempts=a, keepalive=False)
+                o, t, r)
             if self.move_completion is not None:
                 self.move_completion.complete(data)
         self.reactor.register_callback(send)
-    def send_command(self, cmd, send_attempts=1):
+    def send_command(self, cmd, timeout=MMU_TIMEOUT, retries=0):
         with self.mutex:
-            if 'P' in cmd:
-                timeout = 3.
-            if 'W' in cmd:
-                timeout = self.reactor.NEVER
             self.cmd_ack = False
-            self.cmd_resp = None
-            self.cmd_ack, self.cmd_resp = self.mmu_serial.send_with_response(
-                cmd, timeout, send_attempts)
+            self.cmd_ack, data = self.mmu_serial.send_with_response(
+                cmd, timeout, retries)
             ret = 0
             if not self.cmd_ack:
-                self.gcode.respond_info(self.cmd_resp)
+                self.gcode.respond_info(data)
                 ret = -1
-            elif len(self.cmd_resp) > 2:
+            elif len(data) > 2:
                 try:
-                    ret = int(self.cmd_resp[:-2])
+                    ret = int(data[:-2])
                 except:
                     ret = 0
             return ret
@@ -548,39 +543,45 @@ class MMU2S:
             # XXX - Cut filament
             pass
         cmd = self.get_cmd("SET_TOOL", index)
-        self.mmu_exec_cmd_loop(cmd)
+        self.mmu_exec_cmd(cmd, retries=2)
         self.mmu_continue_loading(index)
         self.current_extruder = index
         self.finda.start_query()
     def mmu_cut_filament(self):
         pass
-    def mmu_exec_cmd_loop(self, cmd, unload=True, load=True,
-                          park=True, hotend_off=True):
+    def mmu_exec_cmd(self, cmd, unload=True, load=True,
+                     park=True, hotend_off=True, retries=0):
         with self.mutex:
             error_recorded = False
+            self.store_hotend_target()
             self.gcode.run_script_from_command(
                 "SAVE_GCODE_STATE STATE=MMU_CMD_STATE")
             self.extruder_motor_off()
-            while not self.cmd_ack:
-                self.send_command_async(cmd, 3)
-                self.mmu_extruder_move_sync(need_unload=unload, need_load=load)
-                if not self.cmd_ack:
-                    if not error_recorded:
-                        error_recorded = True
-                        # XXX - save error to persistent memory
-                        if park:
-                            self.park_extruder()
-                        if hotend_off:
-                            self.gcode.run_script_from_command("M104 S0")
-                        self.extruder_motor_off()
-                    # XXX - Display message on lcd
-                    if not self.mmu_serial.wait_for_user():
-                        # need to raise an error and abort the print
-                        raise self.gcode.error("MMU2S Error, print aborted")
-                elif error_recorded:
-                    error_recorded = False
-                    self.gcode.run_script_from_command(
-                        "M109 S%.4f" % (self.hotend_temp))
+            self.send_command_async(cmd, retries=retries)
+            self.mmu_extruder_move_sync(need_unload=unload, need_load=load)
+            if not self.cmd_ack:
+                error_recorded = True
+                # XXX - save error to persistent memory
+                if park:
+                    self.park_extruder()
+                if hotend_off:
+                    self.gcode.run_script_from_command("M104 S0")
+                self.extruder_motor_off()
+                # XXX - Display message on lcd
+                # XXX - It seems we need two types of delays here,
+                # one that waits for a response from the lcd display
+                # if we turned the hotend off, and the current one that
+                # waits for a mmu button to be pressed.  I need to look
+                # at the mmu code, but is suspect that actions that dont
+                # require the nozzle at temperature automatically go into
+                # wait mode
+                if not self.mmu_serial.wait_for_user():
+                    # need to raise an error and abort the print
+                    raise self.gcode.error("MMU2S Error, print aborted")
+            # XXX - check ok?  Check Finda?
+            if error_recorded:
+                self.gcode.run_script_from_command(
+                    "M109 S%.4f" % (self.hotend_temp))
             self.gcode.run_script_from_command(
                 "RESTORE_GCODE_STATE STATE=MMU_CMD_STATE MOVE=1 MOVE_SPEED=50")
     def mmu_extruder_move_sync(self, need_unload=True, need_load=True):
@@ -634,7 +635,7 @@ class MMU2S:
                     # XXX cut filament
                     pass
                 cmd = self.get_cmd("SET_TOOL", index)
-                self.mmu_exec_cmd_loop(cmd)
+                self.mmu_exec_cmd(cmd)
                 success = self.mmu_load_more()
                 if success:
                     success = self.mmu_can_load()
@@ -644,11 +645,11 @@ class MMU2S:
                 "SAVE_GCODE_STATE STATE=MMU_CMD_STATE")
             # Unload MMU2S filament
             cmd = self.get_cmd("UNLOAD_FILAMENT")
-            self.mmu_exec_cmd_loop(cmd, load=False, park=False)
+            self.mmu_exec_cmd(cmd, load=False, park=False)
             # Pause, Park, notify, return control to user
             self.park_extruder()
             cmd = self.get_cmd("WAIT_FOR_USER")
-            resp = self.send_command(cmd)
+            resp = self.send_command(cmd, timeout=self.reactor.NEVER)
             # XXX - send display / octoprint notification
             if resp == "ABORT":
                 raise self.gcode.error("MMU2S Print Aborted By User")
@@ -663,7 +664,7 @@ class MMU2S:
         for i in range(MAX_LOAD_MORE_ATTEMPTS):
             if self.ir_sensor.get_idler_state():
                 return True
-            self.mmu_exec_cmd_loop(cmd, unload=False)
+            self.mmu_exec_cmd(cmd, unload=False)
         return False
     def mmu_can_load(self):
         # Move extruder forward 60 mm, backward 52, then check idler sensor
@@ -686,12 +687,14 @@ class MMU2S:
         return detect_count > (steps - 4)
     def load_to_nozzle(self):
         pass
-    def park_extruder(self):
+    def store_hotend_target(self):
         curtime = self.reactor.monotonic()
         extruder = self.toolhead.get_extruder()
         e_status = extruder.get_status(curtime)
         self.hotend_temp = e_status['target']
-        gc_status = self.gcode.get_status()
+    def park_extruder(self):
+        curtime = self.reactor.monotonic()
+        gc_status = self.gcode.get_status(curtime)
         current_z = gc_status['gcode_position'].z
         if current_z + self.park_xyz[2] < self.zmax:
             self.gcode.run_script_from_command(

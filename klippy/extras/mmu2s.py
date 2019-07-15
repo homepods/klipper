@@ -88,6 +88,7 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.mmu = mmu
+        self.finda_cmd = self.mmu.get_cmd("READ_FINDA")
         gcode_macro = self.printer.try_load_module(config, 'gcode_macro')
         self.runout_gcode = gcode_macro.load_template(
             config, 'runout_gcode', FINDA_GCODE)
@@ -104,8 +105,7 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
             self.cmd_SET_FILAMENT_SENSOR,
             desc=self.cmd_SET_FILAMENT_SENSOR_help)
     def start_query(self):
-        self.last_state = self.mmu.send_command(
-            self.mmu.get_cmd("READ_FINDA"))
+        self.last_state = self.mmu.send_command(self.finda_cmd)
         if self.last_state < 0:
             logging.info("mmu2s: error reading Finda, cannot initialize")
             return False
@@ -115,8 +115,7 @@ class FindaSensor(filament_switch_sensor.BaseSensor):
     def stop_query(self):
         self.reactor.update_timer(self.query_timer, self.reactor.NEVER)
     def _finda_event(self, eventtime):
-        finda_val = self.mmu.send_command(
-            self.mmu.get_cmd("READ_FINDA"))
+        finda_val = self.mmu.send_command(self.finda_cmd)
         # There is a roundtrip delay when performing reads, so fetch
         # current monotonic time
         curtime = self.reactor.monotonic()
@@ -411,13 +410,14 @@ class MMUTest:
         self.gcode.register_command(
             "MMU_READ_IR", self.cmd_MMU_READ_IR)
     def cmd_MMU_GET_STATUS(self, params):
-        ack = (self.send_command(self.get_cmd("CHECK_ACK")) == 0)
-        version = self.send_command(self.get_cmd("GET_VERSION"))
-        build = self.send_command(self.get_cmd("GET_BUILD_NUMBER"))
-        errors = self.send_command(self.get_cmd("GET_DRIVE_ERRORS"))
+        cmds = ["CHECK_ACK", "GET_VERSION", "GET_BUILD_NUMBER",
+                "GET_DRIVE_ERRORS"]
+        cmds = [self.get_cmd(c) for c in cmds]
+        responses = [self.send_command(c) for c in cmds]
+        responses[0] = responses[0] == 0
         status = ("MMU Status:\nAcknowledge Test: %d\nVersion: %d\n" +
                   "Build Number: %d\nDrive Errors:%d\n")
-        self.gcode.respond_info(status % (ack, version, build, errors))
+        self.gcode.respond_info(status % responses)
     def cmd_MMU_SET_STEALTH(self, params):
         mode = self.gcode.get_int('MODE', params, minval=0, maxval=1)
         cmd = self.get_cmd("SET_TMC_MODE")
@@ -453,7 +453,7 @@ class MMU2S:
         self.version = self.build_number = 0
         self.user_completion = None
         self.cmd_ack = False
-        self.cmd_resp = None
+        self.move_completion = None
         self.current_extruder = 0
         self.filament_loaded = False
         self.hotend_temp = 0.
@@ -470,7 +470,8 @@ class MMU2S:
     def _mmu_serial_event(self, data):
         if data == "start":
             self.mmu_ready = self.finda.start_query()
-            self.version = self.send_command(self.get_cmd("GET_VERSION"))
+            self.version = self.send_command(
+                self.get_cmd("GET_VERSION"))
             self.build_number = self.send_command(
                 self.get_cmd("GET_BUILD_NUMBER"))
             if self.mmu_ready:
@@ -507,8 +508,10 @@ class MMU2S:
         def send(eventtime, o=cmd, t=timeout, a=send_attempts):
             self.cmd_ack = False
             self.cmd_resp = None
-            self.cmd_ack, self.cmd_resp = self.mmu_serial.send_with_response(
+            self.cmd_ack, data = self.mmu_serial.send_with_response(
                 o, timeout=t, send_attempts=a, keepalive=False)
+            if self.move_completion is not None:
+                self.move_completion.complete(data)
         self.reactor.register_callback(send)
     def send_command(self, cmd, send_attempts=1):
         with self.mutex:
@@ -582,8 +585,9 @@ class MMU2S:
                 "RESTORE_GCODE_STATE STATE=MMU_CMD_STATE MOVE=1 MOVE_SPEED=50")
     def mmu_extruder_move_sync(self, need_unload=True, need_load=True):
         need_unload = need_unload and not self.ir_sensor.get_idler_state()
+        self.move_completion = self.reactor.completion()
         self.reactor.pause(self.reactor.monotonic() + .1)
-        while self.cmd_resp is None:
+        while not self.cmd_ack:
             if need_unload:
                 if not self.extruder_unload_filament():
                     self.extruder_motor_off()
@@ -599,8 +603,10 @@ class MMU2S:
                     need_load = False
                     self.mmu_serial.send(b"A\n")
             else:
-                # wait until response is recd
-                self.reactor.pause(self.reactor.monotonic() + .1)
+                break
+        data = self.move_completion.wait()
+        self.move_completion = None
+        return data
     def extruder_load_filament(self):
         self.loading_in_progress = True
         self.gcode.run_script_from_command(
@@ -641,7 +647,8 @@ class MMU2S:
             self.mmu_exec_cmd_loop(cmd, load=False, park=False)
             # Pause, Park, notify, return control to user
             self.park_extruder()
-            resp = self.send_command("WAIT_FOR_USER")
+            cmd = self.get_cmd("WAIT_FOR_USER")
+            resp = self.send_command(cmd)
             # XXX - send display / octoprint notification
             if resp == "ABORT":
                 raise self.gcode.error("MMU2S Print Aborted By User")
@@ -652,12 +659,11 @@ class MMU2S:
                     "MOVE=1 MOVE_SPEED=50\n" % (self.hotend_temp))
                 attempts = 1
     def mmu_load_more(self):
+        cmd = self.get_cmd("CONTINUE_LOAD")
         for i in range(MAX_LOAD_MORE_ATTEMPTS):
             if self.ir_sensor.get_idler_state():
                 return True
-            self.reactor.register_callback(
-                lambda e, s=self: s.extruder_move_async(e, need_unload=False))
-            self.send_command("CONTINUE_LOAD")
+            self.mmu_exec_cmd_loop(cmd, unload=False)
         return False
     def mmu_can_load(self):
         # Move extruder forward 60 mm, backward 52, then check idler sensor

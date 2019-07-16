@@ -9,6 +9,8 @@ import subprocess
 import logging
 import serial
 import filament_switch_sensor
+import json
+import shutil
 
 MMU2_BAUD = 115200
 MMU_TIMEOUT = 45.
@@ -29,7 +31,7 @@ MMU_COMMANDS = {
     "EJECT_FILAMENT": "E%d",
     "RECOVER": "R0",        # Recover after eject
     "WAIT_FOR_USER": "W0",
-    "CUT_FILAMENT": "K0"
+    "CUT_FILAMENT": "K%d"
 }
 
 # Run command helper function allows stdout to be redirected
@@ -264,7 +266,7 @@ class MMU2Serial:
                 logging.warn("MMU2S disconnected")
                 self.disconnect()
         else:
-            self.error_msg = self.DISCONNECT_MSG % str(data[:-1])
+            self.error_msg = self.DISCONNECT_MSG % data[:-1]
     def send_with_response(self, data, timeout=MMU_TIMEOUT,
                            retries=0, keepalive=True):
         # Sends data and waits for acknowledgement.  Returns a tuple,
@@ -272,7 +274,7 @@ class MMU2Serial:
         # the payload if successful, or an error message if the request
         # failed
         if not self.connected:
-            return False, self.DISCONNECT_MSG % str(data[:-1])
+            return False, self.DISCONNECT_MSG % data[:-1]
         self.mmu_response = None
         while True:
             self.send_completion = self.reactor.completion()
@@ -281,7 +283,7 @@ class MMU2Serial:
             except serial.SerialException:
                 logging.warn("MMU2S disconnected")
                 self.disconnect()
-                return False, self.DISCONNECT_MSG % str(data[:-1])
+                return False, self.DISCONNECT_MSG % data[:-1]
             if keepalive:
                 self.reactor.update_timer(
                     self.keepalive_timer, self.reactor.monotonic() + 2.)
@@ -294,10 +296,10 @@ class MMU2Serial:
             if retries:
                 retries -= 1
                 self.gcode.respond_info(
-                    "mmu2s: retrying command %s" % (str(data[:-1])))
+                    "mmu2s: retrying command %s" % (data[:-1]))
             else:
                 break
-        return False, self.NACK_MSG % str(data[:-1])
+        return False, self.NACK_MSG % data[:-1]
     def wait_for_user(self, keepalive=True):
         if not self.connected:
             return False
@@ -318,10 +320,61 @@ class MMU2Serial:
             "mmu2s: waiting for command acknowledgement")
         return eventtime + 2.
 
-# Handles load/store to local persistent storage
-class MMUStorage:
-    def __init__(self):
-        pass
+# Handles load/store to local persistent storage.  Implementation
+# derived from ActiveState dbdict recipe:
+#
+# https://code.activestate.com/recipes/576642/
+#
+# Copyright 2011 Raymond Hettinger
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies orsubstantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+class MMUStorage(dict):
+    def __init__(self, config, *args, **kwargs):
+        self.filename = config.get(
+            'storage_file', "~/mmu_storage.json")
+        self.filename = os.path.expanduser(self.filename)
+        if os.path.exists(self.filename):
+            fileobj = open(self.filename, 'r')
+            with fileobj:
+                self.load(fileobj)
+        dict.__init__(self, *args, **kwargs)
+    def sync(self):
+        tmpfile = self.filename + ".tmp"
+        fileobj = open(tmpfile, 'w')
+        try:
+            json.dump(self, fileobj, separators=(',', ':'))
+        except Exception:
+            os.remove(tmpfile)
+            raise
+        finally:
+            fileobj.close()
+        shutil.move(tmpfile, self.filename)
+    def load(self, fileobj):
+        fileobj.seek(0)
+        return self.update(json.load(fileobj))
+    def close(self):
+        self.sync()
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc_info):
+        self.close()
+
 
 # Handles display interaction for MMU prompts
 class MMUDisplay:
@@ -449,6 +502,7 @@ class MMU2S:
         zcfg = config.getsection('stepper_z')
         self.zmax = zcfg.get('position_max')
         self.mutex = self.printer.get_reactor().mutex()
+        self.mmu_storage = MMUStorage(config)
         self.mmu_serial = MMU2Serial(config, self._mmu_serial_event)
         self.finda = FindaSensor(config, self)
         self.ir_sensor = IdlerSensor(config, self)
@@ -458,9 +512,11 @@ class MMU2S:
         self.user_completion = None
         self.cmd_ack = False
         self.move_completion = None
-        self.current_extruder = 0
+        self.current_extruder = self.mmu_storage.get("CURRENT_EXTRUDER", 0)
         self.filament_loaded = False
         self.hotend_temp = 0.
+        self.mmu_errors = 0
+        self.load_errors = 0
         for t_cmd in ["Tx, Tc, T?"]:
             self.gcode.register_command(t_cmd, self.cmd_T_SPECIAL)
         self.printer.register_event_handler(
@@ -540,12 +596,14 @@ class MMU2S:
         self.filament_loaded = True
         # XXX - Mark filament loaded for autodeplete
         if self.cutter_enabled:
-            # XXX - Cut filament
-            pass
+            cmd = self.get_cmd("CUT_FILAMENT", index)
+            self.mmu_exec_cmd(cmd, load=False)
         cmd = self.get_cmd("SET_TOOL", index)
         self.mmu_exec_cmd(cmd, retries=2)
         self.mmu_continue_loading(index)
         self.current_extruder = index
+        with self.mmu_storage as stor:
+            stor["CURRENT_EXTRUDER"] = self.current_extruder
         self.finda.start_query()
     def mmu_cut_filament(self):
         pass
@@ -561,7 +619,8 @@ class MMU2S:
             self.mmu_extruder_move_sync(need_unload=unload, need_load=load)
             if not self.cmd_ack:
                 error_recorded = True
-                # XXX - save error to persistent memory
+                self.mmu_errors += 1
+                self.update_total_errors("MMU_ERRORS")
                 if park:
                     self.park_extruder()
                 if hotend_off:
@@ -626,14 +685,14 @@ class MMU2S:
         if success:
             success = self.mmu_can_load()
         if not success:
-            # XXX increment persistent storage load failure
-            pass
+            self.load_errors += 1
+            self.update_total_errors("MMU_LOAD_ERRORS")
         attempts = 3
         while not success:
             if attempts:
-                if self.cutter_enabled():
-                    # XXX cut filament
-                    pass
+                if self.cutter_enabled:
+                    cmd = self.get_cmd("CUT_FILAMENT", index)
+                    self.mmu_exec_cmd(cmd, load=False)
                 cmd = self.get_cmd("SET_TOOL", index)
                 self.mmu_exec_cmd(cmd)
                 success = self.mmu_load_more()
@@ -712,6 +771,34 @@ class MMU2S:
         extruder = self.toolhead.get_extruder()
         extruder.motor_off(self.toolhead.get_last_move_time())
         self.toolhead.wait_moves()
+    def update_total_errors(self, error):
+        with self.mmu_storage as stor:
+            stor[error] = stor.get(error, 0) + 1
+    def _action_continue_print(self):
+        # XXX
+        return ""
+    def _action_load_tool(self, index):
+        # XXX
+        return ""
+    def _action_unload_tool(self, index):
+        # XXX
+        return ""
+    def _action_load_all(self):
+        # XXX
+        return ""
+    def get_status(self, eventtime):
+        total_mmu_errors = self.mmu_storage.get("MMU_ERRORS", 0)
+        total_load_errors = self.mmu_storage.get("MMU_LOAD_ERRORS", 0)
+        return {
+            "current_extruder": self.current_extruder,
+            "is_loaded": self.filament_loaded,
+            "mmu_errors": self.mmu_errors,
+            "mmu_load_errors": self.load_errors,
+            "total_mmu_errors": total_mmu_errors,
+            "total_mmu_load_errors": total_load_errors,
+            "action_abort": self.mmu_serial.action_abort_wait,
+            "action_continue": self._action_continue_print
+        }
     def cmd_T_SPECIAL(self, params):
         # XXX - After a closer look at Prusa Firmware it seems like these T
         # gcodes may not be necessary.  They all do some form of partial

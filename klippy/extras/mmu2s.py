@@ -71,6 +71,27 @@ def detect_mmu_port():
                     return fname
     return None
 
+class AutoDeplete:
+    def __init__(self):
+        self.filament_status = 0x1F
+    def _check(self, index):
+        return 0 <= index <= 4
+    def mark_loaded(self, index):
+        if self._check(index):
+            self.filament_status |= ((1 << index) & 0x1F)
+    def mark_depleted(self, index):
+        if self._check(index):
+            self.filament_status &= ~((1 << index) & 0x1F)
+    def get_next_available(self, index):
+        if self._check(index):
+            for i in range(5):
+                if (1 << i) & self.filament_status:
+                    return i
+        return index
+    def all_depleted(self):
+        return self.filament_status == 0
+
+
 # XXX - The current gcode is temporary.  Need to determine
 # the appropriate action the printer and MMU should take
 # on a finda runout, then execute the appropriate gcode.
@@ -372,7 +393,7 @@ class MMUStorage(dict):
         self.sync()
     def __enter__(self):
         return self
-    def __exit__(self, *exc_info):
+    def __exit__(self, type=None, value=None, tb=None):
         self.close()
 
 
@@ -617,6 +638,12 @@ class MMU2S:
             self.extruder_motor_off()
             self.send_command_async(cmd, retries=retries)
             self.mmu_extruder_move_sync(need_unload=unload, need_load=load)
+            # XXX - The above two commands mimic the Prusa Firmware calls
+            # to "manage_response()" and "mmu_get_response()".  It appears
+            # that the logic below can only execute if a T0-T4 command is
+            # sent.  For all other responses, it simply queries the finda
+            # and if it gets a result it True is returned and the loop
+            # exits
             if not self.cmd_ack:
                 error_recorded = True
                 self.mmu_errors += 1
@@ -627,6 +654,7 @@ class MMU2S:
                     self.gcode.run_script_from_command("M104 S0")
                 self.extruder_motor_off()
                 # XXX - Display message on lcd
+
                 # XXX - It seems we need two types of delays here,
                 # one that waits for a response from the lcd display
                 # if we turned the hotend off, and the current one that
@@ -803,6 +831,8 @@ class MMU2S:
         # XXX - After a closer look at Prusa Firmware it seems like these T
         # gcodes may not be necessary.  They all do some form of partial
         # toolchange, presumably these are called not via gcode but via display
+        #
+        # UPDATE: T? might be in gcode generated for Single Material MMU mode
         #
         # Hand T commands followed by special characters (x, c, ?)
         cmd = params['#command'].upper()

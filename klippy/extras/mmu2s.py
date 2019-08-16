@@ -630,47 +630,47 @@ class MMU2S:
         pass
     def mmu_exec_cmd(self, cmd, unload=True, load=True,
                      park=True, hotend_off=True, retries=0):
+        error_recorded = False
+        self.store_hotend_target()
+        self.gcode.run_script_from_command(
+            "SAVE_GCODE_STATE STATE=MMU_CMD_STATE")
+        self.extruder_motor_off()
         with self.mutex:
-            error_recorded = False
-            self.store_hotend_target()
-            self.gcode.run_script_from_command(
-                "SAVE_GCODE_STATE STATE=MMU_CMD_STATE")
-            self.extruder_motor_off()
             self.send_command_async(cmd, retries=retries)
             self.mmu_extruder_move_sync(need_unload=unload, need_load=load)
-            # XXX - The above two commands mimic the Prusa Firmware calls
-            # to "manage_response()" and "mmu_get_response()".  It appears
-            # that the logic below can only execute if a T0-T4 command is
-            # sent.  For all other responses, it simply queries the finda
-            # and if it gets a result it True is returned and the loop
-            # exits
-            if not self.cmd_ack:
-                error_recorded = True
-                self.mmu_errors += 1
-                self.update_total_errors("MMU_ERRORS")
-                if park:
-                    self.park_extruder()
-                if hotend_off:
-                    self.gcode.run_script_from_command("M104 S0")
-                self.extruder_motor_off()
-                # XXX - Display message on lcd
+        # XXX - The above two commands mimic the Prusa Firmware calls
+        # to "manage_response()" and "mmu_get_response()".  It appears
+        # that the logic below can only execute if a T0-T4 command is
+        # sent.  For all other responses, it simply queries the finda
+        # and if it gets a result it True is returned and the loop
+        # exits
+        if not self.cmd_ack:
+            error_recorded = True
+            self.mmu_errors += 1
+            self.update_total_errors("MMU_ERRORS")
+            if park:
+                self.park_extruder()
+            if hotend_off:
+                self.gcode.run_script_from_command("M104 S0")
+            self.extruder_motor_off()
+            # XXX - Display message on lcd
 
-                # XXX - It seems we need two types of delays here,
-                # one that waits for a response from the lcd display
-                # if we turned the hotend off, and the current one that
-                # waits for a mmu button to be pressed.  I need to look
-                # at the mmu code, but is suspect that actions that dont
-                # require the nozzle at temperature automatically go into
-                # wait mode
-                if not self.mmu_serial.wait_for_user():
-                    # need to raise an error and abort the print
-                    raise self.gcode.error("MMU2S Error, print aborted")
-            # XXX - check ok?  Check Finda?
-            if error_recorded:
-                self.gcode.run_script_from_command(
-                    "M109 S%.4f" % (self.hotend_temp))
+            # XXX - It seems we need two types of delays here,
+            # one that waits for a response from the lcd display
+            # if we turned the hotend off, and the current one that
+            # waits for a mmu button to be pressed.  I need to look
+            # at the mmu code, but is suspect that actions that dont
+            # require the nozzle at temperature automatically go into
+            # wait mode
+            # XXX - this wait should time out after 5s
+            if not self.mmu_serial.wait_for_user():
+                # need to raise an error and abort the print
+                raise self.gcode.error("MMU2S Error, print aborted")
+        if error_recorded:
             self.gcode.run_script_from_command(
-                "RESTORE_GCODE_STATE STATE=MMU_CMD_STATE MOVE=1 MOVE_SPEED=50")
+                "M109 S%.4f" % (self.hotend_temp))
+        self.gcode.run_script_from_command(
+            "RESTORE_GCODE_STATE STATE=MMU_CMD_STATE MOVE=1 MOVE_SPEED=50")
     def mmu_extruder_move_sync(self, need_unload=True, need_load=True):
         need_unload = need_unload and not self.ir_sensor.get_idler_state()
         self.move_completion = self.reactor.completion()
@@ -728,6 +728,7 @@ class MMU2S:
                     success = self.mmu_can_load()
                 attempts -= 1
                 continue
+            # Max attempts reached, load failed
             self.gcode.run_script_from_command(
                 "SAVE_GCODE_STATE STATE=MMU_CMD_STATE")
             # Unload MMU2S filament
@@ -735,6 +736,16 @@ class MMU2S:
             self.mmu_exec_cmd(cmd, load=False, park=False)
             # Pause, Park, notify, return control to user
             self.park_extruder()
+            # XXX - I'm thining that using pause_resume would
+            # be better here.  What we need is a specific resume
+            # macro that issues a W0 to the MMU,  retries the current
+            # toolchange, then executes RESUME on success.
+            #
+            # The user can have the option of clicking the MMU button,
+            # clicking the display button, or clicking a window in
+            # octoprint.  The problem is that there is no good way
+            # to cancel wait on the MMU, unless I add it to the firmware
+            # myself.
             cmd = self.get_cmd("WAIT_FOR_USER")
             resp = self.send_command(cmd, timeout=self.reactor.NEVER)
             # XXX - send display / octoprint notification

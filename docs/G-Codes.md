@@ -297,6 +297,19 @@ enabled:
 
 See [Working with the BL-Touch](BLTouch.md) for more details.
 
+## Temperature Probe
+
+The following command is available when a "temperature_probe" config section
+is enabled:
+- `PROBE_WAIT TARGET=<temperature> TIMEOUT=<seconds>`:  Blocks gcode execution
+  until the probe reaches the supplied TARGET temperature or until the TIMEOUT
+  is reached.  If the TIMEOUT is not supplied or set to 0 then PROBE_WAIT will
+  block indefinitely.  If the bed or currently selected extruder is enabled
+  PROBE_WAIT will assume that the probe is heating and wait until the current
+  temperature is equal to or above the TARGET.  If both the extruder and bed
+  are off PROBE_WAIT will assume the probe is cooling and wait until the
+  current temperature is equal to or below the TARGET.
+
 ## Delta Calibration
 
 The following commands are available when the "delta_calibrate" config

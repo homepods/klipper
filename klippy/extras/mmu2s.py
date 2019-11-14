@@ -483,8 +483,7 @@ class MMU2USBControl:
             self.gcode.respond_info(
                 "mmu2s: File does not appear to be a valid hex: %s" % (fname))
             return
-        if fname.startswith('~'):
-            fname = os.path.expanduser(fname)
+        fname = os.path.expanduser(fname)
         if os.path.exists(fname):
             # Firmware file found, attempt to locate MMU2S port and flash
             if self.mmu_serial.autodetect:

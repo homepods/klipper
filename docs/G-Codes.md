@@ -560,3 +560,16 @@ been enabled:
     delay duration for the identified [delayed_gcode] and starts the timer
     for gcode execution.  A value of 0 will cancel a pending delayed gcode
     from executing.
+
+## XY Endstop Calibrate
+
+The following command is enabled if a [xy_endstop_calibrate] config section
+has been enabled:
+  - `XY_ENDSTOP_CALIBRATE [CHECK=<0|1>] [AXES=<X|Y|XY>]`:  Intiates XY Endstop
+    calibration.  Before calibration starts, the procedure will check to see
+    if your configuration contains a [homing_override] section and warn that
+    the calibration procedure must be able to home each axis indvidually.  If
+    your your configuration has [homing_override] and you are sure it will not
+    interfere with invidually homing X or Y axis you may add `CHECK=0` to the
+    gcode to proceed.  The AXES parameter allows you to choose the axes you
+    want to calibrate.

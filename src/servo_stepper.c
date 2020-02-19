@@ -84,8 +84,15 @@ servo_stepper_mode_open_loop(struct servo_stepper *ss, uint32_t position)
 {
     uint32_t vs_position = virtual_stepper_get_position(ss->virtual_stepper);
     //a4954_set_phase(ss->stepper_driver, vs_position, ss->run_current_scale);
-    a4954_set_phase(ss->stepper_driver, vs_position * ss->step_multiplier,
-        ss->run_current_scale);
+    if (vs_position != ss->pid_ctrl.last_stp_pos) {
+        int32_t move_diff = (ss->pid_ctrl.last_stp_pos - vs_position)
+            * ss->step_multiplier;
+        if (ABS(move_diff) > 256)
+            shutdown("Move Difference too large");
+        a4954_set_phase(ss->stepper_driver, vs_position * ss->step_multiplier,
+            ss->run_current_scale);
+        ss->pid_ctrl.last_stp_pos = vs_position;
+    }
 }
 
 static void
@@ -266,6 +273,7 @@ servo_stepper_set_disabled(struct servo_stepper *ss)
     a4954_disable(ss->stepper_driver);
     uint32_t position = virtual_stepper_get_position(ss->virtual_stepper);
     a4954_update_last_phase(ss->stepper_driver, position * ss->step_multiplier);
+    ss->pid_ctrl.last_stp_pos = position;
     irq_enable();
 }
 

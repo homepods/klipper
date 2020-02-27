@@ -414,12 +414,22 @@ class MCU_spi_position:
         self.positions = []
         return list(pos)
     def get_position(self):
-        params = self.query_pos_cmd.send_with_response(
-            [self.oid], response='spi_position_result', response_oid=self.oid)
+        reactor = self.printer.get_reactor()
+        completion = reactor.completion()
+
+        def response_handler(params):
+            reactor.async_complete(completion, params)
+        self.mcu.register_response(
+            response_handler, "spi_position_result", self.oid)
+        self.query_pos_cmd.send([self.oid])
+        waketime = reactor.monotonic() + 1.
+        params = completion.wait(waketime=waketime)
+        self.mcu.register_response(
+            None, "spi_position_result", self.oid)
         if params is not None:
             return (params['position'], params.get('interp_ticks'))
         else:
-            return None
+            return None, None
     def apply_calibration(self, print_time, calibration, reversed_cal):
         calibration.append(int(reversed_cal))
         for i, cal in enumerate(calibration):

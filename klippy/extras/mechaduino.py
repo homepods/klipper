@@ -123,8 +123,9 @@ class MCU_virtual_stepper:
             "virtual_set_next_step_dir oid=%c dir=%c")
         self._reset_cmd_id = self._mcu.lookup_command_id(
             "virtual_reset_step_clock oid=%c clock=%u")
-        self._get_position_cmd = self._mcu.lookup_command(
-            "virtual_stepper_get_position oid=%c")
+        self._get_position_cmd = self._mcu.lookup_query_command(
+            "virtual_stepper_get_position oid=%c",
+            "stepper_position oid=%c pos=%i", oid=self._oid)
         self._ffi_lib.stepcompress_fill(
             self._stepqueue, self._mcu.seconds_to_clock(max_error),
             self._invert_dir, step_cmd_id, dir_cmd_id)
@@ -176,8 +177,7 @@ class MCU_virtual_stepper:
             raise error("Internal error in stepcompress")
         if not did_trigger or self._mcu.is_fileoutput():
             return
-        params = self._get_position_cmd.send_with_response(
-            [self._oid], response='stepper_position', response_oid=self._oid)
+        params = self._get_position_cmd.send([self._oid])
         mcu_pos_dist = params['pos'] * self._step_dist
         if self._invert_dir:
             mcu_pos_dist = -mcu_pos_dist
@@ -211,8 +211,7 @@ class MCU_virtual_stepper:
         return self._ffi_lib.itersolve_is_active_axis(
             self._stepper_kinematics, axis)
     def get_realtime_position(self):
-        params = self._get_position_cmd.send_with_response(
-            [self._oid], response='stepper_position', response_oid=self._oid)
+        params = self._get_position_cmd.send([self._oid])
         return params['pos']
 
 # Servo stepper feedback control code
@@ -251,8 +250,10 @@ class MCU_servo_stepper:
         self.set_mode_cmd = self.mcu.lookup_command(
             "servo_stepper_set_mode oid=%c mode=%c run_current_scale=%u"
             " flex=%u kp=%hi ki=%hi kd=%hi", cq=cmd_queue)
-        self.get_stats_cmd = self.mcu.lookup_command(
-            "servo_stepper_get_stats oid=%c", cq=cmd_queue)
+        self.get_stats_cmd = self.mcu.lookup_query_command(
+            "servo_stepper_get_stats oid=%c",
+            "servo_stepper_stats oid=%c error=%i max_time=%u",
+            oid=self.oid, cq=cmd_queue)
     def set_disabled(self, print_time):
         clock = self.mcu.print_time_to_clock(print_time)
         self.set_mode_cmd.send(
@@ -289,8 +290,7 @@ class MCU_servo_stepper:
     def get_servo_mode(self):
         return self.servo_mode
     def get_servo_stats(self):
-        params = self.get_stats_cmd.send_with_response(
-            [self.oid], response='servo_stepper_stats', response_oid=self.oid)
+        params = self.get_stats_cmd.send([self.oid])
         return (params['error'], params.get('max_time'))
 
 

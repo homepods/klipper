@@ -281,7 +281,8 @@ class FileManager:
         try:
             done, result = self.file_req_pipe.recv()
         except Exception:
-            logging.exception("file_manager: error receiving file list")
+            self.reactor.pause(eventtime + .01)
+            return
 
         if not done:
             # result should be a string for logging

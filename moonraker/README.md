@@ -43,7 +43,7 @@ Moonraker's only additional dependency is Tornado.
   directories are removed.  If you are ok with everything else listed (will
   mostly be *.pyc files), the following command will remove them:
   ```
-  git clean -x -d
+  git clean -x -d -f
   ```
   It is also possible to use interactive mode and choose which files you want to
   remove:
@@ -207,17 +207,26 @@ websocket's request header.
 
 The following startup sequence is recommened for clients which make use of
 the websocket:
-  - Attempt to connect to `/websocket` until successful using a timer-like
-    mechanism
-  - Once connected, query `/printer/info` (or `get_printer_info`) for the ready
-    status.  If not ready check `error_detected`.  If not ready and no error,
-    continue querying on a timer until the printer is either ready or an error
-    is detected.
-  - After the printer has identified itself as ready make subscription requests,
-    get the current file list, etc
-  - If the websocket disconnects the client can assume that the server is shutdown.
-    It should consider the printer's state to be NOT ready and try reconnecting to
-    the websocket until successful, repeating the above steps.
+1) Attempt to connect to `/websocket` until successful using a timer-like
+   mechanism
+2) Once connected, query `/printer/info` (or `get_printer_info`) for the ready
+   status.
+   - If the response returns an error (such as 404), set a timeout for
+     2 seconds and try again.
+   - If the response returns success, check the result's `is_ready` attribute
+     to determine if Klipper is ready.
+     - If Klipper is ready you may proceed to request status of printer objects
+       make subscriptions, get the file list, etc.
+     - If not ready check `error_detected` to see if Klippy has experienced an
+       error.
+       - If an error is detected it might be wise to prompt the user.  You can
+         get a description of the error from the `message` attribute
+       - If no error then re-request printer info in 2s.
+- Repeat step 2s until Klipper reports ready.  T
+- Client's should watch for the `notify_klippy_state_changed` event.  If it reports
+  disconnected then Klippy has either been stopped or restarted.  In this
+  instance the client should repeat the steps above to determine when
+  klippy is ready.
 
 ## API
 

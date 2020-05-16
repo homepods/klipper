@@ -124,14 +124,9 @@ class GcodeAnalysis:
     def get_metadata(self, file_path):
         if not os.path.isfile(file_path):
             raise IOError("File Not Found: %s" % (file_path))
-        file_data = None
+        metadata = {}
+        file_data = slicer = None
         size = os.path.getsize(file_path)
-        last_modified = time.ctime(os.path.getmtime(file_path))
-        metadata = {
-            'size': size,
-            'modified': last_modified}
-
-        slicer = None
         with open(file_path, 'rb') as f:
             # read the default size, which should be enough to
             # identify the slicer
@@ -153,50 +148,20 @@ class GcodeAnalysis:
                 metadata.update(slicer.parse_metadata(file_data, file_path))
         return metadata
 
-    def update_metadata(self, file_path, metadata):
-        if not os.path.isfile(file_path):
-            raise IOError("File Not Found: %s" % (file_path))
-        size = os.path.getsize(file_path)
-        last_modified = time.ctime(os.path.getmtime(file_path))
-        if metadata.get('size', 0) == size and \
-                metadata.get('modified', '') == last_modified:
-            # File has not changed
-            return metadata
-        return self.get_metadata(file_path)
 
-def _find_files(path):
-    file_names = []
-    for fname in os.listdir(path):
-        if fname[0] == '.':
-            continue
-        full_path = os.path.join(path, fname)
-        if os.path.isdir(full_path):
-            sublist = _find_files(full_path)
-            for sf in sublist:
-                file_names.append(os.path.join(fname, sf))
-        elif os.path.isfile(full_path):
-            ext = fname[fname.rfind('.')+1:]
-            if ext in VALID_GCODE_EXTS:
-                file_names.append(fname)
-    return file_names
-
-def _update_file_list(kpipe, prev_info, sdpath, gca):
+def _update_file_metadata(kpipe, new_info, sdpath, gca):
     file_info = {}
-    try:
-        file_names = _find_files(sdpath)
-    except Exception:
-        kpipe.send((False, "file_manager: unable to generate file list"))
-        file_names = {}
-    for fname in file_names:
+    for fname in new_info.keys():
         fpath = os.path.join(sdpath, fname)
-        metadata = prev_info.get(fname, {})
+        filedata = new_info.get(fname, {})
         try:
-            file_info[fname] = gca.update_metadata(
-                fpath, metadata)
+            filedata.update(gca.get_metadata(fpath))
+            file_info[fname] = filedata
         except Exception as e:
             kpipe.send((False, "file_manager: " + str(e)))
             continue
-        if 'slicer' not in file_info[fname] and not metadata:
+        if 'slicer' not in file_info[fname]:
+            # Only log the error once per file
             msg = "file_manager: Unable to detect Slicer " \
                 "Template for file '%s'" % (fpath)
             kpipe.send((False, msg))
@@ -277,7 +242,7 @@ class FileManager:
     def get_sd_directory(self):
         return self.sd_path
 
-    def _process_file_proc_response(self, eventtime):
+    def _handle_metadata_response(self, eventtime):
         try:
             done, result = self.file_req_pipe.recv()
         except Exception:
@@ -291,26 +256,57 @@ class FileManager:
             # result is the dictionary
             self.file_req_comp.complete(result)
 
+    def _generate_base_info(self):
+        # Use os.walk find files in sd path and subdirs
+        base_info = {}
+        new_info = {}
+        for root, dirs, files in os.walk(self.sd_path, followlinks=True):
+            for name in files:
+                ext = name[name.rfind('.')+1:]
+                if ext not in VALID_GCODE_EXTS:
+                    continue
+                full_path = os.path.join(root, name)
+                r_path = full_path[len(self.sd_path) + 1:]
+                size = os.path.getsize(full_path)
+                modified = time.ctime(os.path.getmtime(full_path))
+                if r_path in self.file_info:
+                    prev_info = self.file_info[r_path]
+                    if size == prev_info['size'] and \
+                            modified == prev_info['modified']:
+                        # No signs that file has changed, use existing data
+                        base_info[r_path] = prev_info
+                        continue
+                new_info[r_path] = {'size': size, 'modified': modified}
+        return base_info, new_info
+
     def _update_file_list(self):
         with self.file_req_mutex:
+            base_info, new_info = self._generate_base_info()
+            if not new_info:
+                # Don't launch the process if no new files located
+                self.file_info = base_info
+                return
             ppipe, cpipe = multiprocessing.Pipe()
             util.set_nonblock(ppipe.fileno())
             self.file_req_pipe = ppipe
             fd_hdlr = self.reactor.register_fd(
-                ppipe.fileno(), self._process_file_proc_response)
+                ppipe.fileno(), self._handle_metadata_response)
             self.file_req_comp = self.reactor.completion()
             proc = multiprocessing.Process(
-                target=_update_file_list,
-                args=(cpipe, self.file_info, self.sd_path, self.gca))
+                target=_update_file_metadata,
+                args=(cpipe, new_info, self.sd_path, self.gca))
             proc.start()
             waketime = self.reactor.monotonic() + 2.
             res = self.file_req_comp.wait(waketime=waketime)
             if res is None:
                 # completion timed out
                 logging.info("file_manager: File list request timed out")
-                self.file_info = {}
+                # just update with the bare file info (name, size, modified)
+                base_info.update(new_info)
             else:
-                self.file_info = res
+                base_info.update(res)
+            self.file_info = base_info
+            self.reactor.unregister_fd(fd_hdlr)
             # Give process a chance to terminate
             curtime = self.reactor.monotonic()
             endtime = curtime + 1.
@@ -321,7 +317,6 @@ class FileManager:
             else:
                 logging.info("file_manager: Process still alive, terminating")
                 proc.terminate()
-            self.reactor.unregister_fd(fd_hdlr)
             ppipe.close()
             self.file_req_pipe.close()
             self.file_req_pipe = None

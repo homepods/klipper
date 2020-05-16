@@ -153,7 +153,7 @@ class ServerConnection:
         requests[0] = self.partial_data + requests[0]
         self.partial_data = requests.pop()
         for req in requests:
-            logging.info(
+            logging.debug(
                 "ServerConnection: Request received from Moonraker %s" % (req))
             try:
                 decoded_req = json_loads_byteified(req)
@@ -174,7 +174,7 @@ class ServerConnection:
         except Exception as e:
             web_request.set_error(WebRequestError(e.message))
         result = web_request.finish()
-        logging.info(
+        logging.debug(
             "ServerConnection: Sending response - %s" % (str(result)))
         self.send({'method': "response", 'params': result})
 

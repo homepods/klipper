@@ -10,6 +10,9 @@ import time
 import logging
 import multiprocessing
 
+class MetadataError(Exception):
+    pass
+
 def strip_quotes(string):
     quotes = string[0] + string[-1]
     if quotes in ['""', "''"]:
@@ -36,11 +39,15 @@ class SlicerTemplate:
             'layer_height': None,
             'filament_total': None,
             'estimated_time': None}
+        self.thumbnail_template = None
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
         for name in self.templates:
             if config.get(name + "_script", None) is not None:
                 self.templates[name] = gcode_macro.load_template(
                     config, name + "_script")
+        if config.get('thumbnail_script', None) is not None:
+            self.thumbnail_template = gcode_macro.load_template(
+                config, "thumbnail_script")
 
     def _regex_find_floats(self, pattern, data, strict=False):
         # If strict is enabled, pattern requires a floating point
@@ -70,6 +77,15 @@ class SlicerTemplate:
     def _regex_findall(self, pattern, data):
         return re.findall(pattern, data)
 
+    def _regex_split(self, pattern, data):
+        return re.split(pattern, data)
+
+    def _slice_list(self, data, start=0, stop=None):
+        if stop is not None:
+            return data[start:stop]
+        else:
+            return data[start:]
+
     def check_slicer_name(self, file_data):
         return re.search(self.name_pattern, file_data) is not None
 
@@ -79,7 +95,9 @@ class SlicerTemplate:
             'file_data': file_data,
             'regex_find_floats': self._regex_find_floats,
             'regex_find_ints': self._regex_find_ints,
-            'regex_findall': self._regex_findall}
+            'regex_findall': self._regex_findall,
+            'regex_split': self._regex_split,
+            'slice_list': self._slice_list}
         for name, template in self.templates.iteritems():
             if template is None:
                 continue
@@ -87,9 +105,40 @@ class SlicerTemplate:
                 result = float(template.render(context))
                 metadata[name] = result
             except Exception:
-                logging.info(
+                raise MetadataError(
                     "gcode_meta: Unable to extract '%s' from file '%s'"
                     % (name, file_path))
+        if self.thumbnail_template is not None:
+            try:
+                thumbs = self.thumbnail_template.render(context)
+                thumbs = [t.strip() for t in thumbs.split('\n') if t.strip()]
+            except Exception:
+                raise MetadataError(
+                    "gcode_meta: Unable to extract 'thumbnail' from file '%s'"
+                    % (file_path))
+            if thumbs:
+                metadata['thumbnails'] = []
+                for t in thumbs:
+                    t_data = {}
+                    parts = [p.strip() for p in t.split(',') if p.strip()]
+                    if len(parts) != 4:
+                        raise MetadataError(
+                            "gcode_meta: Incorrect Thumbnail data, only %d "
+                            "parts received" % (len(parts)))
+                    try:
+                        t_data['width'] = int(parts[0])
+                        t_data['height'] = int(parts[1])
+                        size = int(parts[2])
+                    except Exception:
+                        raise MetadataError(
+                            "gcode_meta: Unable to convert thumbnail data to"
+                            " integer: %s" % (str(parts[:3])))
+                    if size != len(parts[3]):
+                        raise Exception(
+                            "gcode_meta: Thumbnail size mismatch: reported %d"
+                            ", actual %d" % (size, len(parts[3])))
+                    t_data['data'] = parts[3]
+                    metadata['thumbnails'].append(t_data)
         return metadata
 
     def get_slicer_name(self):
@@ -154,9 +203,9 @@ def _update_file_metadata(kpipe, new_info, sdpath, gca):
     for fname in new_info.keys():
         fpath = os.path.join(sdpath, fname)
         filedata = new_info.get(fname, {})
+        file_info[fname] = filedata
         try:
             filedata.update(gca.get_metadata(fpath))
-            file_info[fname] = filedata
         except Exception as e:
             kpipe.send((False, "file_manager: " + str(e)))
             continue
@@ -165,7 +214,7 @@ def _update_file_metadata(kpipe, new_info, sdpath, gca):
             msg = "file_manager: Unable to detect Slicer " \
                 "Template for file '%s'" % (fpath)
             kpipe.send((False, msg))
-    kpipe.send((True, file_info))
+    kpipe.send((True, new_info))
 
 class FileManager:
     def __init__(self, config):

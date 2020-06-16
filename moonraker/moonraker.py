@@ -256,14 +256,14 @@ class ServerManager:
 
     def _handle_temp_store_request(self, web_request):
         store = {}
-        for name, sensor in self.temperature_store.iteritems():
-            store[name] = {k: list(v) for k, v in sensor.iteritems()}
+        for name, sensor in self.temperature_store.items():
+            store[name] = {k: list(v) for k, v in sensor.items()}
         web_request.notify(store)
 
     def _update_temperature_store(self):
         # XXX - If klippy is not connected, set values to zero
         # as they are unknown
-        for sensor, (temp, target) in self.last_temps.iteritems():
+        for sensor, (temp, target) in self.last_temps.items():
             self.temperature_store[sensor]['temperatures'].append(temp)
             self.temperature_store[sensor]['targets'].append(target)
 
@@ -287,6 +287,9 @@ class ServerManager:
 
     @gen.coroutine
     def _kill_server(self):
+        # XXX - Currently this function is not used.
+        # Should I expose functionality to shutdown
+        # or restart the server, or simply remove this?
         logging.info(
             "Shutting Down Webserver")
         self.temp_update_cb.stop()

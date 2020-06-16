@@ -44,7 +44,7 @@ class Authorization:
     def _prune_conn_handler(self):
         cur_time = time.time()
         expired_conns = []
-        for ip, access_time in self.trusted_connections.iteritems():
+        for ip, access_time in self.trusted_connections.items():
             if cur_time - access_time > CONNECTION_TIMEOUT:
                 expired_conns.append(ip)
         for ip in expired_conns:

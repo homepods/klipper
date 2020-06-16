@@ -21,7 +21,7 @@ def byteify(data, ignore_dicts=False):
         return [byteify(i, True) for i in data]
     if isinstance(data, dict) and not ignore_dicts:
         return {byteify(k, True): byteify(v, True)
-                for k, v in data.iteritems()}
+                for k, v in data.items()}
     return data
 
 def json_loads_byteified(data):
@@ -33,7 +33,11 @@ class ServerError(Exception):
         Exception.__init__(self, message)
         self.status_code = status_code
 
-
+# XXX - Currently logging over the socket is not implemented.
+# I don't think it would be wise to log everything over the
+# socket, however it may be useful to log some specific items.
+# Decide what to do, then either finish the implementation or
+# remove this code
 class SocketLoggingHandler(logging.Handler):
     def __init__(self, server_manager):
         super(SocketLoggingHandler, self).__init__()

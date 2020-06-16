@@ -23,7 +23,7 @@ MAX_UPLOAD_SIZE = 200 * 1024 * 1024
 def _status_parser(request):
     query_args = request.query_arguments
     args = {}
-    for key, vals in query_args.iteritems():
+    for key, vals in query_args.items():
         parsed = []
         for v in vals:
             if v:
@@ -35,7 +35,7 @@ def _status_parser(request):
 def _default_parser(request):
     query_args = request.query_arguments
     args = {}
-    for key, vals in query_args.iteritems():
+    for key, vals in query_args.items():
         if len(vals) != 1:
             raise tornado.web.HTTPError(404, "Invalid Query String")
         args[key] = vals[0]

@@ -22,9 +22,12 @@ class QueryEndstops:
     def get_status(self, eventtime):
         return {'last_query': {name: value for name, value in self.last_state}}
     def _handle_web_request(self, web_request):
-        print_time = self.printer.lookup_object('toolhead').get_last_move_time()
-        self.last_state = [(name, mcu_endstop.query_endstop(print_time))
-                           for mcu_endstop, name in self.endstops]
+        gc_mutex = self.printer.lookup_object('gcode').get_mutex()
+        toolhead = self.printer.lookup_object('toolhead')
+        with gc_mutex:
+            print_time = toolhead.get_last_move_time()
+            self.last_state = [(name, mcu_endstop.query_endstop(print_time))
+                               for mcu_endstop, name in self.endstops]
         web_request.send({name: ["open", "TRIGGERED"][not not t]
                           for name, t in self.last_state})
     cmd_QUERY_ENDSTOPS_help = "Report on the status of each endstop"

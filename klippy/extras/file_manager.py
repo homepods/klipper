@@ -98,7 +98,7 @@ class SlicerTemplate:
             'regex_findall': self._regex_findall,
             'regex_split': self._regex_split,
             'slice_list': self._slice_list}
-        for name, template in self.templates.iteritems():
+        for name, template in self.templates.items():
             if template is None:
                 continue
             try:

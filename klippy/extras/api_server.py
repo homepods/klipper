@@ -67,7 +67,7 @@ class StatusHandler:
         eventtime = self.reactor.monotonic()
         objs = self.printer.lookup_objects()
         status_objs = {n: o for n, o in objs if hasattr(o, "get_status")}
-        for name, obj in status_objs.iteritems():
+        for name, obj in status_objs.items():
             attrs = obj.get_status(eventtime)
             self.available_objects[name] = attrs.keys()
             if name == "heaters":
@@ -157,7 +157,7 @@ class StatusHandler:
         if obj in self.poll_ticks:
             return self.poll_ticks[obj]
         else:
-            for key, poll_ticks in self.poll_ticks.iteritems():
+            for key, poll_ticks in self.poll_ticks.items():
                 if re.match(key, obj):
                     return poll_ticks
         return self.poll_ticks['default']
@@ -167,7 +167,7 @@ class StatusHandler:
         poll_times = {}
         for sub in self.subscriptions:
             objects.update(sub[0])
-            for key, attrs in sub[0].iteritems():
+            for key, attrs in sub[0].items():
                 poll_times[key] = sub[1] * self.tick_time
                 if attrs == []:
                     objects[key] = list(self.available_objects[key])
@@ -255,8 +255,9 @@ class MoonrakerConfig:
             logging.info("Moonraker: server not connected,"
                          " events will not be processed")
 
-        # Attempt to load the pause_resume modules
+        # Attempt to load the pause_resume and display_status objects
         self.printer.load_object(config, "pause_resume")
+        self.printer.load_object(config, "display_status")
 
     def _load_server_config(self, config):
         # Helper to parse (string, float) tuples from the config

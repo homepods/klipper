@@ -23,7 +23,7 @@ def byteify(data, ignore_dicts=False):
         return [byteify(i, True) for i in data]
     if isinstance(data, dict) and not ignore_dicts:
         return {byteify(k, True): byteify(v, True)
-                for k, v in data.iteritems()}
+                for k, v in data.items()}
     return data
 
 def json_loads_byteified(data):

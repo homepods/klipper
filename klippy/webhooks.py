@@ -195,6 +195,7 @@ class ServerConnection:
                         waketime = self.reactor.monotonic() + .001
                         self.reactor.pause(waketime)
                         continue
+                retries = 10
                 if sent > 0:
                     data = data[sent:]
                 else:

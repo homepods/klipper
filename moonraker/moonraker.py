@@ -136,6 +136,8 @@ class ServerManager:
                     % (cmd))
 
     def klippy_send(self, data):
+        # TODO: need a mutex or lock to make sure that multiple co-routines
+        # do not attempt to send
         if not self.is_klippy_connected:
             return False
         retries = 10
@@ -150,6 +152,7 @@ class ServerManager:
                     # XXX - Should pause for 1ms here
                     retries -= 1
                     continue
+            retries = 10
             if sent > 0:
                 data = data[sent:]
             else:

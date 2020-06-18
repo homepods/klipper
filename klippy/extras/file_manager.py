@@ -345,7 +345,7 @@ class FileManager:
                 target=_update_file_metadata,
                 args=(cpipe, new_info, self.sd_path, self.gca))
             proc.start()
-            waketime = self.reactor.monotonic() + 2.
+            waketime = self.reactor.monotonic() + 4.
             res = self.file_req_comp.wait(waketime=waketime)
             if res is None:
                 # completion timed out
